@@ -842,25 +842,7 @@ def do_manage_tool_qualifications(request=None):
             user = qualification.user
             tool = qualification.tool
             if tool.qualification_expiration_days or tool.qualification_expiration_never_used_days:
-                last_tool_use = None
-                try:
-                    # Last tool use cannot be before the last time they qualified
-                    last_tool_use = max(
-                        as_timezone(UsageEvent.objects.filter(user=user, tool=tool).latest("start").start).date(),
-                        qualification.qualified_on,
-                    )
-                    expiration_date: date = (
-                        last_tool_use + timedelta(days=tool.qualification_expiration_days)
-                        if tool.qualification_expiration_days
-                        else None
-                    )
-                except UsageEvent.DoesNotExist:
-                    # User never used the tool, use the qualification date
-                    expiration_date: date = (
-                        qualification.qualified_on + timedelta(days=tool.qualification_expiration_never_used_days)
-                        if tool.qualification_expiration_never_used_days
-                        else None
-                    )
+                last_tool_use, expiration_date = qualification.get_last_use_and_expiration_date()
                 # Check for staff on tools
                 if expiration_date and not user.is_staff_on_tool(tool):
                     if expiration_date <= date.today():
