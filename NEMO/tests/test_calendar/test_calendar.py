@@ -4,9 +4,9 @@ from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
-from NEMO.models import Reservation, Tool, User
+from NEMO.models import Reservation, Tool, UsageEvent, User
 from NEMO.tests.test_utilities import NEMOTestCaseMixin, create_user_and_project
-from NEMO.views.customization import CalendarCustomization
+from NEMO.views.customization import ApplicationCustomization, CalendarCustomization
 
 
 class CalendarTestCase(NEMOTestCaseMixin, TestCase):
@@ -34,7 +34,9 @@ class CalendarTestCase(NEMOTestCaseMixin, TestCase):
         team_member, team_project = create_user_and_project()
         other_user, other_project = create_user_and_project()
         pi, pi_project = create_user_and_project()
+        account_manager, account_manager_project = create_user_and_project()
         pi.managed_projects.add(team_project)
+        account_manager.managed_accounts.add(team_project.account)
         # other user is also a member of the team project, but not a PI
         other_user.projects.add(team_project)
         start = timezone.now().replace(hour=10, minute=0, second=0, microsecond=0)
@@ -48,28 +50,42 @@ class CalendarTestCase(NEMOTestCaseMixin, TestCase):
                 project=project,
                 short_notice=False,
             )
+            UsageEvent.objects.create(
+                tool=tool, user=user, operator=user, project=project, start=start, end=start + timedelta(hours=1)
+            )
         feed_data = {
             "start": (start - timedelta(days=1)).strftime("%Y-%m-%d"),
             "end": (start + timedelta(days=1)).strftime("%Y-%m-%d"),
-            "event_type": "reservations",
             "team_schedule": "true",
         }
-        # PI sees team schedule option and only reservations on projects they manage
-        self.login_as(pi)
-        self.assertContains(self.client.get(reverse("calendar")), 'id="extra-links-team-schedule"')
-        response = self.client.get(reverse("event_feed"), feed_data)
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, team_member.username)
-        self.assertNotContains(response, other_user.username)
-        # Project member doesn't see the option or any reservations by default
+        reservation_feed = {**feed_data, "event_type": "reservations"}
+        usage_feed = {**feed_data, "event_type": f"{ApplicationCustomization.get('facility_name').lower()} use"}
+        # PI and account manager see team schedule option and only reservations and usage on projects they manage
+        for manager in [pi, account_manager]:
+            self.login_as(manager)
+            response = self.client.get(reverse("calendar"))
+            self.assertContains(response, 'id="extra-links-team-schedule"')
+            self.assertTrue(response.context["team_schedule_usage"])
+            for feed in [reservation_feed, usage_feed]:
+                response = self.client.get(reverse("event_feed"), feed)
+                self.assertEqual(response.status_code, 200)
+                self.assertContains(response, team_member.username)
+                self.assertNotContains(response, other_user.username)
+        # Project member doesn't see the option or any events by default
         self.login_as(other_user)
         self.assertNotContains(self.client.get(reverse("calendar")), 'id="extra-links-team-schedule"')
-        response = self.client.get(reverse("event_feed"), feed_data)
-        self.assertNotContains(response, team_member.username)
-        self.assertNotContains(response, other_user.username)
-        # Unless the team schedule is enabled for project members
+        for feed in [reservation_feed, usage_feed]:
+            response = self.client.get(reverse("event_feed"), feed)
+            self.assertNotContains(response, team_member.username)
+            self.assertNotContains(response, other_user.username)
+        # Unless the team schedule is enabled for project members, which only applies to reservations
         CalendarCustomization.set("calendar_team_schedule_project_members", "enabled")
-        self.assertContains(self.client.get(reverse("calendar")), 'id="extra-links-team-schedule"')
-        response = self.client.get(reverse("event_feed"), feed_data)
+        response = self.client.get(reverse("calendar"))
+        self.assertContains(response, 'id="extra-links-team-schedule"')
+        self.assertFalse(response.context["team_schedule_usage"])
+        response = self.client.get(reverse("event_feed"), reservation_feed)
         self.assertContains(response, team_member.username)
         self.assertContains(response, other_user.username)
+        response = self.client.get(reverse("event_feed"), usage_feed)
+        self.assertNotContains(response, team_member.username)
+        self.assertNotContains(response, other_user.username)

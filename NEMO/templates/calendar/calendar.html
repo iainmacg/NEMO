@@ -903,6 +903,7 @@ function change_calendar_event_type(calling_element)
         item_tree_areas.show();
 		$(proxy_reservation_button).hide();
 		$(scheduled_outage_button).hide();
+		hide_team_usage_for_members();
 		update_event_sources();
 	}
 	else if(event_type === "specific user")
@@ -922,6 +923,19 @@ function change_calendar_event_type(calling_element)
 		clear_specific_user();
 	}
     update_clear_selection_btn_display();
+}
+
+{# Team usage is only shown to project and account managers, members fall back to their personal schedule #}
+function hide_team_usage_for_members()
+{
+    {% if team_schedule and not team_schedule_usage %}
+        let event_type = get_event_type();
+        if (event_type === "{{ facility_name|lower }} use" || event_type === "reservations and use")
+        {
+            $("#extra-links-team-schedule").hide();
+            if (get_selected_item() === "team_schedule") set_selected_item($("#extra-links-personal-schedule"), true);
+        }
+    {% endif %}
 }
 
 function get_specific_user_activity(jquery_event, search_selection, dataset_name)
@@ -1172,6 +1186,7 @@ function on_load()
 	$('#item_search').autocomplete('items', on_item_search_selection, {% json_search_base_with_extra_fields tools|add:areas %}, {% if tools and areas %}false{% else %}true{% endif %});
 	$("#item_search").focus();
 	load_sidebar_state();
+	hide_team_usage_for_members();
     update_clear_selection_btn_display();
     {% if user.is_staff or customizations|get_item:"calendar_qualified_tools" == "enabled" %}
         {# Filter "my tools" depending on the status of the button. #}
