@@ -57,7 +57,6 @@ from NEMO.views.customization import (
     ToolCustomization,
     get_media_file_contents,
 )
-from NEMO.views.usage import get_managed_projects
 
 calendar_logger = getLogger(__name__)
 
@@ -120,6 +119,12 @@ def calendar(request, item_type=None, item_id=None):
     reservation_confirmation_date_format = CalendarCustomization.get("reservation_confirmation_date_format")
     reservation_confirmation_time_format = CalendarCustomization.get("reservation_confirmation_time_format")
 
+    # Team schedule: managers see reservations and usage on their projects, members (if enabled) only reservations
+    team_schedule_usage = get_team_projects(user).exists()
+    team_schedule = team_schedule_usage or (
+        CalendarCustomization.get_bool("calendar_team_schedule_project_members") and user.projects.exists()
+    )
+
     dictionary = {
         "rendered_item_tree_html": rendered_item_tree_html,
         "tools": list(tools),
@@ -149,9 +154,8 @@ def calendar(request, item_type=None, item_id=None):
         "reservation_confirmation_time_format": reservation_confirmation_time_format,
         "self_login": False,
         "self_logout": False,
-        "team_schedule": user.managed_projects.exists()
-        or user.managed_accounts.exists()
-        or (CalendarCustomization.get_bool("calendar_team_schedule_project_members") and user.projects.exists()),
+        "team_schedule": team_schedule,
+        "team_schedule_usage": team_schedule_usage,
     }
     login_logout = ApplicationCustomization.get_bool("calendar_login_logout", raise_exception=False)
     self_login = ApplicationCustomization.get_bool("self_log_in", raise_exception=False)
@@ -232,6 +236,14 @@ def extract_calendar_dates(parameters):
     return start, end
 
 
+def get_team_projects(user: User, include_members=False):
+    """Projects the user manages directly or through an account, and optionally the ones they are a member of."""
+    team = Q(id__in=user.managed_projects.all()) | Q(account__in=user.managed_accounts.all())
+    if include_members:
+        team |= Q(id__in=user.projects.all())
+    return Project.objects.filter(team)
+
+
 def reservation_event_feed(request, start, end):
     events = Reservation.objects.filter(cancelled=False, missed=False, shortened=False)
     outages = ScheduledOutage.objects.none()
@@ -277,10 +289,8 @@ def reservation_event_feed(request, start, end):
     # Filter events that only have to do with the projects the current user manages (or is a member of).
     team_schedule = request.GET.get("team_schedule")
     if team_schedule:
-        team_projects = get_managed_projects(request.user)
-        if CalendarCustomization.get_bool("calendar_team_schedule_project_members"):
-            team_projects = team_projects.union(request.user.projects.all())
-        events = events.filter(project__in=team_projects)
+        include_members = CalendarCustomization.get_bool("calendar_team_schedule_project_members")
+        events = events.filter(project__in=get_team_projects(request.user, include_members))
 
     dictionary = {
         "events": events,
@@ -317,7 +327,7 @@ def usage_event_feed(request, start, end):
         missed_reservations = Reservation.objects.filter(missed=True, user=request.user)
     elif team_schedule:
         # Filter events that only have to do with the projects the current user manages.
-        managed_projects = get_managed_projects(request.user)
+        managed_projects = get_team_projects(request.user)
         usage_events = UsageEvent.objects.filter(project__in=managed_projects)
         area_access_events = AreaAccessRecord.objects.filter(project__in=managed_projects)
         missed_reservations = Reservation.objects.filter(missed=True, project__in=managed_projects)
