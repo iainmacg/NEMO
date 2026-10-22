@@ -75,18 +75,20 @@ def status_dashboard(request, tab=None):
     elif interest == "staff":
         return render(request, "status_dashboard/staff.html", get_staff_status(request))
     elif interest == "tools":
-        return render(request, "status_dashboard/tools.html", get_tools_dictionary())
+        return render(request, "status_dashboard/tools.html", get_tools_dictionary(request))
     elif interest == "occupancy":
         return render(request, "status_dashboard/occupancy.html", get_occupancy_dictionary(request))
 
 
-def get_tools_dictionary():
-    return {"tool_summary": create_tool_summary(tooltip_info=True)}
+def get_tools_dictionary(request):
+    tool_categories = request.GET.getlist("category", [])
+    return {"tool_summary": create_tool_summary(tooltip_info=True, tool_categories=tool_categories)}
 
 
 def get_occupancy_dictionary(request):
+    area_names = request.GET.getlist("area", [])
     reservations_can_expire = Area.objects.filter(requires_reservation=True)
-    area_items, no_occupants = process_area_access_record_with_parents(request.user)
+    area_items, no_occupants = process_area_access_record_with_parents(request.user, area_names)
     return {"area_items": area_items, "no_occupants": no_occupants, "reservations_can_expire": reservations_can_expire}
 
 
@@ -298,9 +300,14 @@ def show_staff_status(request):
     )
 
 
-def process_area_access_record_with_parents(user: User):
+def process_area_access_record_with_parents(user: User, area_names=None):
     show_not_qualified_areas = StatusDashboardCustomization.get("dashboard_display_not_qualified_areas")
     records = AreaAccessRecord.objects.filter(end=None, staff_charge=None)
+    if area_names:
+        area_name_filter = Q()
+        for area_name in area_names:
+            area_name_filter |= Q(area__name__iexact=area_name)
+        records = records.filter(area_name_filter)
     if not user.is_any_part_of_staff and show_not_qualified_areas != "enabled":
         records = records.filter(area__in=user.accessible_areas())
     records = records.prefetch_related("customer", "project", "area")
@@ -346,24 +353,34 @@ def area_tree_helper(
     yield "out"
 
 
-def create_tool_summary(tooltip_info=False):
-    tools = Tool.objects.filter(visible=True).prefetch_related(
-        "_primary_owner",
-        "_backup_owners",
-        "_superusers",
-        Prefetch("_requires_area_access", queryset=Area.objects.all().only("name")),
+def create_tool_summary(tooltip_info=False, tool_categories=None):
+    category_filter = Q()
+    if tool_categories:
+        for category in tool_categories:
+            category_filter |= Q(_category__istartswith=category)
+    tools = (
+        Tool.objects.filter(visible=True)
+        .filter(category_filter)
+        .prefetch_related(
+            "_primary_owner",
+            "_backup_owners",
+            "_superusers",
+            Prefetch("_requires_area_access", queryset=Area.objects.all().only("name")),
+        )
     )
-    tasks = Task.objects.filter(cancelled=False, resolved=False, tool__visible=True).prefetch_related("tool")
+    tasks = Task.objects.filter(cancelled=False, resolved=False, tool__visible=True, tool__in=tools)
     unavailable_resources = Resource.objects.filter(available=False).prefetch_related(
         "fully_dependent_tools", "partially_dependent_tools"
     )
     # also check for visibility on the parent if there is one (alternate tool are hidden)
-    usage_events = UsageEvent.objects.filter(
-        Q(end=None, tool__visible=True) | Q(end=None, tool__parent_tool__visible=True)
-    ).prefetch_related("operator", "user", "tool")
+    usage_events = (
+        UsageEvent.objects.filter(Q(end=None, tool__visible=True) | Q(end=None, tool__parent_tool__visible=True))
+        .filter(tool__in=tools)
+        .prefetch_related("operator", "user", "tool")
+    )
     scheduled_outages = ScheduledOutage.objects.filter(
         start__lte=timezone.now(), end__gt=timezone.now(), area__isnull=True
-    )
+    ).prefetch_related("tool", "resource__fully_dependent_tools", "resource__partially_dependent_tools")
     tool_summary = merge(tools, tasks, unavailable_resources, usage_events, scheduled_outages, tooltip_info)
     tool_summary = list(tool_summary.values())
     tool_sort = StatusDashboardCustomization.get("dashboard_tool_sort")
@@ -479,7 +496,7 @@ def create_area_summary(area_tree: ModelTreeHelper = None, add_resources=True, a
 def merge(tools, tasks, unavailable_resources, usage_events, scheduled_outages, tooltip_info=False):
     result = {}
     tools_with_delayed_logoff_in_effect = [
-        x.tool.tool_or_parent_id() for x in UsageEvent.objects.filter(end__gt=timezone.now())
+        x.tool.tool_or_parent_id() for x in UsageEvent.objects.filter(end__gt=timezone.now()).prefetch_related("tool")
     ]
     parent_ids = Tool.objects.filter(parent_tool__isnull=False).values_list("parent_tool_id", flat=True)
     for tool in tools:
@@ -504,8 +521,8 @@ def merge(tools, tasks, unavailable_resources, usage_events, scheduled_outages, 
         }
         if tooltip_info:
             result[tool.tool_or_parent_id()]["get_tool_info_html"] = tool.get_tool_info_html()
-    for task in tasks:
-        result[task.tool.id]["problematic"] = True
+    for tool_id in tasks.values_list("tool_id", flat=True):
+        result[tool_id]["problematic"] = True
     for event in usage_events:
         result[event.tool.tool_or_parent_id()]["operator"] = str(event.operator)
         result[event.tool.tool_or_parent_id()]["user"] = str(event.operator)
@@ -517,15 +534,19 @@ def merge(tools, tasks, unavailable_resources, usage_events, scheduled_outages, 
         result[event.tool.tool_or_parent_id()]["operator_is_service_personnel"] = event.operator.is_service_personnel
     for resource in unavailable_resources:
         for tool in resource.fully_dependent_tools.filter(visible=True):
-            result[tool.id]["required_resource_is_unavailable"] = True
+            if tool.id in result:
+                result[tool.id]["required_resource_is_unavailable"] = True
         for tool in resource.partially_dependent_tools.filter(visible=True):
-            result[tool.id]["nonrequired_resource_is_unavailable"] = True
+            if tool.id in result:
+                result[tool.id]["nonrequired_resource_is_unavailable"] = True
     for outage in scheduled_outages:
-        if outage.tool_id and outage.tool.visible:
-            result[outage.tool.id]["scheduled_outage"] = True
+        if outage.tool_id and outage.tool.visible and outage.tool_id in result:
+            result[outage.tool_id]["scheduled_outage"] = True
         elif outage.resource_id:
             for t in outage.resource.fully_dependent_tools.filter(visible=True):
-                result[t.id]["scheduled_outage"] = True
+                if t.id in result:
+                    result[t.id]["scheduled_outage"] = True
             for t in outage.resource.partially_dependent_tools.filter(visible=True):
-                result[t.id]["scheduled_partial_outage"] = True
+                if t.id in result:
+                    result[t.id]["scheduled_partial_outage"] = True
     return result

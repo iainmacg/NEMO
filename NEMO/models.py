@@ -4,14 +4,13 @@ import datetime
 import json
 import os
 import sys
-from collections import Counter
 from datetime import timedelta
 from enum import Enum
 from html import escape
 from json import loads
 from logging import getLogger
 from re import match
-from typing import Dict, List, Optional, Set, TYPE_CHECKING, Union
+from typing import Dict, List, Optional, Set, TYPE_CHECKING, Tuple, Union
 
 from django.conf import settings
 from django.contrib.auth.models import BaseUserManager, Group, Permission, PermissionsMixin
@@ -24,7 +23,7 @@ from django.db.models import BooleanField, Case, Exists, IntegerChoices, OuterRe
 from django.db.models.manager import Manager
 from django.db.models.signals import pre_delete
 from django.dispatch import receiver
-from django.template import loader
+from django.template import Context, Template, loader
 from django.template.defaultfilters import linebreaksbr
 from django.urls import reverse
 from django.utils import timezone
@@ -37,6 +36,11 @@ from mptt.models import MPTTModel
 from NEMO import fields
 from NEMO.constants import (
     ADDITIONAL_INFORMATION_MAXIMUM_LENGTH,
+    CALENDAR_PROJECT_DEFAULT_COLOR,
+    CALENDAR_TOOL_RESERVATION_DEFAULT_COLOR,
+    CALENDAR_TOOL_USAGE_DEFAULT_COLOR,
+    CALENDAR_AREA_RESERVATION_DEFAULT_COLOR,
+    CALENDAR_AREA_ACCESS_DEFAULT_COLOR,
     CHAR_FIELD_LARGE_LENGTH,
     CHAR_FIELD_MEDIUM_LENGTH,
     CHAR_FIELD_SMALL_LENGTH,
@@ -93,7 +97,8 @@ class BaseQuerySet(models.query.QuerySet):
         return getattr(connection, "vendor", "") == "oracle"
 
     def model_text_fields(self) -> List[str]:
-        return [f.name for f in self.model._meta.fields if isinstance(f, models.TextField)]
+        lob_field_types = (models.TextField, models.JSONField, models.BinaryField)
+        return [f.name for f in self.model._meta.fields if isinstance(f, lob_field_types)]
 
 
 class BaseManager(Manager.from_queryset(BaseQuerySet)):
@@ -204,6 +209,9 @@ class BaseDocumentModel(BaseModel):
     def can_be_embedded(self):
         return any([self.link().lower().endswith(ext) for ext in supported_embedded_extensions])
 
+    def is_allowed(self, user: User):
+        raise NotImplementedError(f"{self.__class__.__name__} must provide an is_allowed method")
+
     def __str__(self):
         return self.filename()
 
@@ -296,6 +304,25 @@ class RequestStatus(IntegerChoices):
 class ToolUsageQuestionType(models.TextChoices):
     PRE = "pre", _("Pre")
     POST = "post", _("Post")
+
+
+class CoreFacility(SerializationByNameModel):
+    name = models.CharField(
+        max_length=CHAR_FIELD_MEDIUM_LENGTH, unique=True, help_text="The name of this core facility."
+    )
+    external_id = models.CharField(
+        max_length=CHAR_FIELD_MEDIUM_LENGTH,
+        null=True,
+        blank=True,
+        help_text="An external ID to associate with this core facility.",
+    )
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name_plural = "Core facilities"
 
 
 class UserPreferences(BaseModel):
@@ -502,7 +529,7 @@ class PhysicalAccessLevel(BaseModel):
     def accessible_at(self, time):
         return self.accessible(time)
 
-    def accessible(self, time: datetime = None):
+    def accessible(self, time: datetime.datetime = None):
         if time is not None:
             accessible_time = timezone.localtime(time)
         else:
@@ -532,7 +559,7 @@ class PhysicalAccessLevel(BaseModel):
                 return True
         return False
 
-    def ongoing_closure_time(self, time: datetime = None):
+    def ongoing_closure_time(self, time: datetime.datetime = None):
         if time is not None:
             accessible_time = timezone.localtime(time)
         else:
@@ -565,7 +592,7 @@ class TemporaryPhysicalAccess(BaseModel):
     def accessible_at(self, time):
         return self.accessible(time)
 
-    def accessible(self, time: datetime = None):
+    def accessible(self, time: datetime.datetime = None):
         if time is not None:
             accessible_time = timezone.localtime(time)
         else:
@@ -575,7 +602,7 @@ class TemporaryPhysicalAccess(BaseModel):
             and self.start_time <= accessible_time <= self.end_time
         )
 
-    def ongoing_closure_time(self, time: datetime = None):
+    def ongoing_closure_time(self, time: datetime.datetime = None):
         return self.physical_access_level.ongoing_closure_time(time)
 
     def display(self):
@@ -863,7 +890,7 @@ class User(BaseModel, PermissionsMixin):
         from NEMO.views.customization import UserCustomization
 
         user_type_required = UserCustomization.get_bool("user_type_required")
-        if user_type_required and UserType.objects.exists() and not self.type_id:
+        if user_type_required and UserType.objects.exists() and self.type_id is None:
             raise ValidationError({"type": _("This field is required.")})
         username_pattern = getattr(settings, "USERNAME_REGEX", None)
         if self.username:
@@ -934,6 +961,25 @@ class User(BaseModel, PermissionsMixin):
         is_reviewer_on_any_area = Area.objects.filter(adjustment_request_reviewers__in=[self]).exists()
         return self.is_facility_manager or is_reviewer_on_any_tool or is_reviewer_on_any_area
 
+    @property
+    def roles(self):
+        roles = []
+        if self.is_staff:
+            roles.append("Staff")
+        if self.is_user_office:
+            roles.append("User Office")
+        if self.is_accounting_officer:
+            roles.append("Accounting Officer")
+        if self.is_service_personnel:
+            roles.append("Service Personnel")
+        if self.is_technician:
+            roles.append("Technician")
+        if self.is_facility_manager:
+            roles.append("Facility Manager")
+        if self.is_superuser:
+            roles.append("Administrator")
+        return roles
+
     def get_username(self):
         return self.username
 
@@ -989,6 +1035,10 @@ class User(BaseModel, PermissionsMixin):
         first_name_initial = self.first_name[0] if self.first_name else ""
         last_name_initial = self.last_name[0] if self.last_name else ""
         return first_name_initial + last_name_initial
+
+    def remove_qualifications(self, tools: list[Tool]):
+        for qualification in Qualification.objects.filter(user=self, tool__in=tools):
+            qualification.delete()
 
     def accessible_access_levels(self):
         if not self.is_staff and not self.is_user_office:
@@ -1136,6 +1186,12 @@ class User(BaseModel, PermissionsMixin):
             )
             return f'<a href="javascript:;" data-title="{content}" data-placement="bottom" class="contact-info-tooltip info-tooltip-container"><span class="glyphicon glyphicon-send small-icon"></span>{self.get_name()}</a>'
 
+    def has_negative_perm(self, perm: str, obj=None):
+        # has_perm return True if the user is an active superuser, so we need to return False here
+        if self.is_active and self.is_superuser:
+            return False
+        return self.has_perm(perm, obj)
+
     def has_perm(self, perm, obj=None):
         # By default we don't use the actual object, similar to django admin
         general_permission = super().has_perm(perm)
@@ -1163,6 +1219,7 @@ class User(BaseModel, PermissionsMixin):
         permissions = (
             ("trigger_timed_services", "Can trigger timed services"),
             ("use_billing_api", "Can use billing API"),
+            ("use_project_billing", "Can use project billing"),
             ("kiosk", "Kiosk services"),
             ("can_impersonate_users", "Can impersonate other users"),
         )
@@ -1179,6 +1236,9 @@ class UserDocuments(BaseDocumentModel):
 
         username = slugify(self.user.username)
         return f"user_documents/{username}/{filename}"
+
+    def is_allowed(self, user: User):
+        return user == self.user or user.is_any_part_of_staff
 
     class Meta(BaseDocumentModel.Meta):
         verbose_name_plural = "User documents"
@@ -1219,26 +1279,46 @@ class Tool(SerializationByNameModel):
     )
     visible = models.BooleanField(default=True, help_text="Specifies whether this tool is visible to users.")
     _description = models.TextField(
-        db_column="description", null=True, blank=True, help_text="HTML syntax could be used"
+        db_column="description",
+        verbose_name="description",
+        null=True,
+        blank=True,
+        help_text="HTML syntax could be used",
     )
     _serial = models.CharField(
-        db_column="serial", null=True, blank=True, max_length=CHAR_FIELD_SMALL_LENGTH, help_text="Serial Number"
+        db_column="serial",
+        verbose_name="serial",
+        null=True,
+        blank=True,
+        max_length=CHAR_FIELD_SMALL_LENGTH,
+        help_text="Serial Number",
     )
     _image = models.ImageField(
         db_column="image",
+        verbose_name="image",
         upload_to=get_tool_image_filename,
         blank=True,
         help_text="An image that represent the tool. Maximum width and height are 500px",
     )
     _tool_calendar_color = models.CharField(
         db_column="tool_calendar_color",
+        verbose_name="tool usage calendar color",
         max_length=9,
-        default="#33ad33",
+        default=CALENDAR_TOOL_USAGE_DEFAULT_COLOR,
+        help_text="Color for tool usage in calendar overviews",
+        validators=[color_hex_validator],
+    )
+    _tool_reservation_calendar_color = models.CharField(
+        db_column="tool_reservation_calendar_color",
+        verbose_name="tool reservation calendar color",
+        max_length=9,
+        default=CALENDAR_TOOL_RESERVATION_DEFAULT_COLOR,
         help_text="Color for tool reservations in calendar overviews",
         validators=[color_hex_validator],
     )
     _category = models.CharField(
         db_column="category",
+        verbose_name="category",
         null=True,
         blank=True,
         max_length=CHAR_FIELD_LARGE_LENGTH,
@@ -1246,21 +1326,34 @@ class Tool(SerializationByNameModel):
     )
     _operational = models.BooleanField(
         db_column="operational",
+        verbose_name="operational",
         default=False,
         help_text="Marking the tool non-operational will prevent users from using the tool.",
     )
     _problem_shutdown_enabled = models.BooleanField(
         db_column="problem_shutdown_enabled",
+        verbose_name="problem shutdown enabled",
         default=True,
         help_text="Whether or not users can shut down the tool when reporting a problem.",
     )
+    _core_facility = models.ForeignKey(
+        CoreFacility,
+        db_column="core_facility_id",
+        verbose_name="core facility",
+        null=True,
+        blank=True,
+        related_name="tools",
+        help_text="The core facility this tool belongs to.",
+        on_delete=models.SET_NULL,
+    )
     _properties = fields.JsonField(
-        schema=load_properties_schemas("Tool"), db_column="properties", null=True, blank=True
+        schema=load_properties_schemas("Tool"), db_column="properties", verbose_name="properties", null=True, blank=True
     )
     # Tool permissions
     _primary_owner = models.ForeignKey(
         User,
         db_column="primary_owner_id",
+        verbose_name="primary owner",
         null=True,
         blank=True,
         related_name="primary_tool_owner",
@@ -1270,6 +1363,7 @@ class Tool(SerializationByNameModel):
     _backup_owners = models.ManyToManyField(
         User,
         db_table="NEMO_tool_backup_owners",
+        verbose_name="backup owners",
         blank=True,
         related_name="backup_for_tools",
         help_text="Alternate staff members who are responsible for administration of this tool when the primary owner is unavailable.",
@@ -1277,6 +1371,7 @@ class Tool(SerializationByNameModel):
     _superusers = models.ManyToManyField(
         User,
         db_table="NEMO_tool_superusers",
+        verbose_name="superusers",
         blank=True,
         related_name="superuser_for_tools",
         help_text="Superusers who can train users on this tool.",
@@ -1292,33 +1387,69 @@ class Tool(SerializationByNameModel):
     _adjustment_request_reviewers = models.ManyToManyField(
         User,
         db_table="NEMO_tool_adjustment_request_reviewers",
+        verbose_name="adjustment request reviewers",
         blank=True,
         related_name="adjustment_request_reviewer_on_tools",
         help_text="Users who can approve/deny adjustment requests for this tool. Defaults to facility managers if left blank.",
     )
     # Extra info
-    _location = models.CharField(db_column="location", null=True, blank=True, max_length=CHAR_FIELD_SMALL_LENGTH)
+    _location = models.CharField(
+        db_column="location", verbose_name="location", null=True, blank=True, max_length=CHAR_FIELD_SMALL_LENGTH
+    )
     _phone_number = models.CharField(
-        db_column="phone_number", null=True, blank=True, max_length=CHAR_FIELD_SMALL_LENGTH
+        db_column="phone_number", verbose_name="phone number", null=True, blank=True, max_length=CHAR_FIELD_SMALL_LENGTH
     )
     _notification_email_address = models.EmailField(
         db_column="notification_email_address",
+        verbose_name="notification email address",
         blank=True,
         null=True,
         help_text="Messages that relate to this tool (such as comments, problems, and shutdowns) will be forwarded to this email address. This can be a normal email address or a mailing list address.",
     )
     _interlock = models.OneToOneField(
-        "Interlock", db_column="interlock_id", blank=True, null=True, on_delete=models.SET_NULL
+        "Interlock",
+        db_column="interlock_id",
+        verbose_name="interlock",
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
     )
-    _qualifications_never_expire = models.BooleanField(
-        default=False,
-        db_column="qualifications_never_expire",
-        help_text="Check this box if qualifications for this tool should never expire (even if the tool qualification expiration feature is enabled).",
+    # Qualification expiration fields
+    _qualification_reminder_days = models.CharField(
+        db_column="qualification_reminder_days",
+        verbose_name="qualification reminder days",
+        null=True,
+        blank=True,
+        max_length=CHAR_FIELD_MEDIUM_LENGTH,
+        validators=[validate_comma_separated_integer_list],
+        help_text="The (optional) number of days to send a reminder prior to the user's tool qualification expiration (below). A comma-separated list can be used for multiple reminders. This applies to both expiration cases.",
+    )
+    _qualification_expiration_days = models.PositiveIntegerField(
+        db_column="qualification_expiration_days",
+        verbose_name="qualification expiration days",
+        null=True,
+        blank=True,
+        help_text="The number of days from the user’s last tool use until the qualification expires.",
+    )
+    _qualification_expiration_never_used_days = models.PositiveIntegerField(
+        db_column="qualification_expiration_never_used_days",
+        verbose_name="qualification expiration never used days",
+        null=True,
+        blank=True,
+        help_text="Number of days from the user's first qualification until the qualification expires (if the user never used the tool).",
+    )
+    _qualification_notification_email = fields.MultiEmailField(
+        db_column="qualification_notification_email",
+        verbose_name="qualification notification email",
+        null=True,
+        blank=True,
+        help_text="The email addresses to cc on tool qualification expiration and on reminders. Separate multiple emails with commas.",
     )
     # Policy fields:
     _requires_area_access = TreeForeignKey(
         "Area",
         db_column="requires_area_access_id",
+        verbose_name="Requires area access id",
         null=True,
         blank=True,
         help_text="Indicates that this tool is physically located in a billable area and requires an active area access record in order to be operated.",
@@ -1326,6 +1457,7 @@ class Tool(SerializationByNameModel):
     )
     _requires_area_occupancy_minimum = models.PositiveIntegerField(
         db_column="requires_area_occupancy_minimum",
+        verbose_name="requires area occupancy minimum",
         null=True,
         blank=True,
         help_text=_(
@@ -1335,11 +1467,13 @@ class Tool(SerializationByNameModel):
     _ask_to_leave_area_when_done_using = models.BooleanField(
         default=False,
         db_column="ask_to_leave_area_when_done_using",
+        verbose_name="ask to leave area when done using",
         help_text="Check this box to ask the user if they want to log out of the area when they are done using the tool.",
     )
     _grant_physical_access_level_upon_qualification = models.ForeignKey(
         "PhysicalAccessLevel",
         db_column="grant_physical_access_level_upon_qualification_id",
+        verbose_name="grant physical access level upon qualification",
         null=True,
         blank=True,
         help_text="The designated physical access level is granted to the user upon qualification for this tool.",
@@ -1347,6 +1481,7 @@ class Tool(SerializationByNameModel):
     )
     _grant_badge_reader_access_upon_qualification = models.CharField(
         db_column="grant_badge_reader_access_upon_qualification",
+        verbose_name="grant badge reader access upon qualification",
         max_length=CHAR_FIELD_SMALL_LENGTH,
         null=True,
         blank=True,
@@ -1354,6 +1489,7 @@ class Tool(SerializationByNameModel):
     )
     _reservation_horizon = models.PositiveIntegerField(
         db_column="reservation_horizon",
+        verbose_name="reservation horizon",
         default=14,
         null=True,
         blank=True,
@@ -1361,75 +1497,95 @@ class Tool(SerializationByNameModel):
     )
     _minimum_usage_block_time = models.PositiveIntegerField(
         db_column="minimum_usage_block_time",
+        verbose_name="minimum usage block time",
         null=True,
         blank=True,
         help_text="The minimum amount of time (in minutes) that a user must reserve this tool for a single reservation. Leave this field blank to indicate that no minimum usage block time exists for this tool.",
     )
     _maximum_usage_block_time = models.PositiveIntegerField(
         db_column="maximum_usage_block_time",
+        verbose_name="maximum usage block time",
         null=True,
         blank=True,
         help_text="The maximum amount of time (in minutes) that a user may reserve this tool for a single reservation. Leave this field blank to indicate that no maximum usage block time exists for this tool.",
     )
     _maximum_reservations_per_day = models.PositiveIntegerField(
         db_column="maximum_reservations_per_day",
+        verbose_name="maximum reservations per day",
         null=True,
         blank=True,
         help_text="The maximum number of reservations a user may make per day for this tool.",
     )
     _maximum_future_reservations = models.PositiveIntegerField(
         db_column="maximum_future_reservations",
+        verbose_name="maximum future reservations",
         null=True,
         blank=True,
         help_text="The maximum number of reservations a user may make in the future for this tool.",
     )
     _minimum_time_between_reservations = models.PositiveIntegerField(
         db_column="minimum_time_between_reservations",
+        verbose_name="minimum time between reservations",
         null=True,
         blank=True,
         help_text="The minimum amount of time (in minutes) that the same user must have between any two reservations for this tool.",
     )
     _maximum_future_reservation_time = models.PositiveIntegerField(
         db_column="maximum_future_reservation_time",
+        verbose_name="maximum future reservation time",
         null=True,
         blank=True,
         help_text="The maximum amount of time (in minutes) that a user may reserve from the current time onwards.",
     )
     _missed_reservation_threshold = models.PositiveIntegerField(
         db_column="missed_reservation_threshold",
+        verbose_name="missed reservation threshold",
         null=True,
         blank=True,
         help_text='The amount of time (in minutes) that a tool reservation may go unused before it is automatically marked as "missed" and hidden from the calendar. Usage can be from any user, regardless of who the reservation was originally created for. The cancellation process is triggered by a timed job on the web server.',
+    )
+    _late_cancellation_reservation_threshold = models.PositiveIntegerField(
+        db_column="late_cancellation_reservation_threshold",
+        verbose_name="late cancellation reservation threshold",
+        null=True,
+        blank=True,
+        help_text='The amount of time (in minutes) before its start time that a tool reservation may be canceled before it is automatically marked as "missed" and hidden from the calendar.',
     )
     _max_delayed_logoff = models.PositiveIntegerField(
         null=True,
         blank=True,
         db_column="max_delayed_logoff",
+        verbose_name="max delayed logoff",
         help_text='[Optional] Maximum delay in minutes that users may enter upon logging off before another user may use the tool. Some tools require "spin-down" or cleaning time after use. Leave blank to disable.',
     )
     _policy_off_between_times = models.BooleanField(
         db_column="policy_off_between_times",
+        verbose_name="policy off between times",
         default=False,
         help_text="Check this box to disable policy rules every day between the given times",
     )
     _policy_off_start_time = models.TimeField(
         db_column="policy_off_start_time",
+        verbose_name="policy off start time",
         null=True,
         blank=True,
         help_text="The start time when policy rules should NOT be enforced",
     )
     _policy_off_end_time = models.TimeField(
         db_column="policy_off_end_time",
+        verbose_name="policy off end time",
         null=True,
         blank=True,
         help_text="The end time when policy rules should NOT be enforced",
     )
     _policy_off_weekend = models.BooleanField(
         db_column="policy_off_weekend",
+        verbose_name="policy off weekend",
         default=False,
         help_text="Whether or not policy rules should be enforced on weekends",
     )
     _operation_mode = models.IntegerField(
+        verbose_name="operation mode",
         choices=OperationMode.Choices,
         default=OperationMode.REGULAR,
         help_text="The operation mode of the tool, which determines if reservations and wait list are allowed.",
@@ -1452,17 +1608,6 @@ class Tool(SerializationByNameModel):
     def category(self, value):
         self.raise_setter_error_if_child_tool("category")
         self._category = value
-
-    @property
-    def qualifications_never_expire(self):
-        return (
-            self.parent_tool.qualifications_never_expire if self.is_child_tool() else self._qualifications_never_expire
-        )
-
-    @qualifications_never_expire.setter
-    def qualifications_never_expire(self, value):
-        self.raise_setter_error_if_child_tool("qualifications_never_expire")
-        self._qualifications_never_expire = value
 
     @property
     def description(self):
@@ -1510,6 +1655,15 @@ class Tool(SerializationByNameModel):
         self._problem_shutdown_enabled = value
 
     @property
+    def core_facility(self):
+        return self.parent_tool.core_facility if self.is_child_tool() else self._core_facility
+
+    @core_facility.setter
+    def core_facility(self, value):
+        self.raise_setter_error_if_child_tool("core_facility")
+        self._core_facility = value
+
+    @property
     def properties(self):
         return self.parent_tool.properties if self.is_child_tool() else self._properties
 
@@ -1540,28 +1694,13 @@ class Tool(SerializationByNameModel):
     def backup_owners(self) -> QuerySetType[User]:
         return self.parent_tool.backup_owners if self.is_child_tool() else self._backup_owners
 
-    @backup_owners.setter
-    def backup_owners(self, value):
-        self.raise_setter_error_if_child_tool("backup_owners")
-        self._backup_owners = value
-
     @property
     def superusers(self) -> QuerySetType[User]:
         return self.parent_tool.superusers if self.is_child_tool() else self._superusers
 
-    @superusers.setter
-    def superusers(self, value):
-        self.raise_setter_error_if_child_tool("superusers")
-        self._superusers = value
-
     @property
     def staff(self) -> QuerySetType[User]:
         return self.parent_tool.staff if self.is_child_tool() else self._staff
-
-    @staff.setter
-    def staff(self, value):
-        self.raise_setter_error_if_child_tool("staff")
-        self._staff = value
 
     @property
     def adjustment_request_reviewers(self) -> QuerySetType[User]:
@@ -1570,11 +1709,6 @@ class Tool(SerializationByNameModel):
             if self.is_child_tool()
             else self._adjustment_request_reviewers
         )
-
-    @adjustment_request_reviewers.setter
-    def adjustment_request_reviewers(self, value):
-        self.raise_setter_error_if_child_tool("_adjustment_request_reviewers")
-        self._adjustment_request_reviewers = value
 
     @property
     def location(self):
@@ -1611,6 +1745,60 @@ class Tool(SerializationByNameModel):
     def interlock(self, value):
         self.raise_setter_error_if_child_tool("interlock")
         self._interlock = value
+
+    @property
+    def qualification_reminder_days(self):
+        return (
+            self.parent_tool.qualification_reminder_days if self.is_child_tool() else self._qualification_reminder_days
+        )
+
+    @qualification_reminder_days.setter
+    def qualification_reminder_days(self, value):
+        self.raise_setter_error_if_child_tool("qualification_reminder_days")
+        self._qualification_reminder_days = value
+
+    @property
+    def qualification_expiration_days(self):
+        return (
+            self.parent_tool.qualification_expiration_days
+            if self.is_child_tool()
+            else self._qualification_expiration_days
+        )
+
+    @qualification_expiration_days.setter
+    def qualification_expiration_days(self, value):
+        self.raise_setter_error_if_child_tool("qualification_expiration_days")
+        self._qualification_expiration_days = value
+
+    @property
+    def qualification_expiration_never_used_days(self):
+        return (
+            self.parent_tool.qualification_expiration_never_used_days
+            if self.is_child_tool()
+            else self._qualification_expiration_never_used_days
+        )
+
+    @qualification_expiration_never_used_days.setter
+    def qualification_expiration_never_used_days(self, value):
+        self.raise_setter_error_if_child_tool("qualification_expiration_never_used_days")
+        self._qualification_expiration_never_used_days = value
+
+    @property
+    def qualification_notification_email(self):
+        return (
+            self.parent_tool.qualification_notification_email
+            if self.is_child_tool()
+            else self._qualification_notification_email
+        )
+
+    @qualification_notification_email.setter
+    def qualification_notification_email(self, value):
+        self.raise_setter_error_if_child_tool("qualification_notification_email")
+        self._qualification_notification_email = value
+
+    @property
+    def required_resources(self) -> QuerySetType[Resource]:
+        return self.parent_tool.required_resources if self.is_child_tool() else self.required_resource_set
 
     @property
     def requires_area_access(self):
@@ -1764,6 +1952,19 @@ class Tool(SerializationByNameModel):
         self._missed_reservation_threshold = value
 
     @property
+    def late_cancellation_reservation_threshold(self):
+        return (
+            self.parent_tool.late_cancellation_reservation_threshold
+            if self.is_child_tool()
+            else self._late_cancellation_reservation_threshold
+        )
+
+    @late_cancellation_reservation_threshold.setter
+    def late_cancellation_reservation_threshold(self, value):
+        self.raise_setter_error_if_child_tool("late_cancellation_reservation_threshold")
+        self._late_cancellation_reservation_threshold = value
+
+    @property
     def max_delayed_logoff(self):
         return self.parent_tool.max_delayed_logoff if self.is_child_tool() else self._max_delayed_logoff
 
@@ -1818,6 +2019,19 @@ class Tool(SerializationByNameModel):
         self._tool_calendar_color = value
 
     @property
+    def tool_reservation_calendar_color(self):
+        return (
+            self.parent_tool.tool_reservation_calendar_color
+            if self.is_child_tool()
+            else self._tool_reservation_calendar_color
+        )
+
+    @tool_reservation_calendar_color.setter
+    def tool_reservation_calendar_color(self, value):
+        self.raise_setter_error_if_child_tool("tool_reservation_calendar_color")
+        self._tool_reservation_calendar_color = value
+
+    @property
     def operation_mode(self):
         return self.parent_tool.operation_mode if self.is_child_tool() else self._operation_mode
 
@@ -1835,6 +2049,30 @@ class Tool(SerializationByNameModel):
         self.raise_setter_error_if_child_tool("abuse_weight")
         self._abuse_weight = value
 
+    def get_calendar_usage_color(self):
+        from NEMO.views.customization import CalendarCustomization
+
+        if self.tool_calendar_color.lower() == CALENDAR_TOOL_USAGE_DEFAULT_COLOR:
+            return CalendarCustomization.get("calendar_color_tool_usage_default")
+        return self.tool_calendar_color
+
+    def get_calendar_reservation_color(self):
+        from NEMO.views.customization import CalendarCustomization
+
+        if self.tool_reservation_calendar_color.lower() == CALENDAR_TOOL_RESERVATION_DEFAULT_COLOR:
+            return CalendarCustomization.get("calendar_color_tool_reservation_default")
+        return self.tool_reservation_calendar_color
+
+    def get_calendar_missed_reservation_color(self):
+        from NEMO.views.customization import CalendarCustomization
+
+        return CalendarCustomization.get("calendar_color_tool_missed_reservation")
+
+    def get_calendar_personal_schedule_color(self):
+        from NEMO.views.customization import CalendarCustomization
+
+        return CalendarCustomization.get("calendar_color_tool_personal_schedule")
+
     def allow_wait_list(self):
         return self.operation_mode in [self.OperationMode.WAIT_LIST, self.OperationMode.HYBRID]
 
@@ -1842,7 +2080,7 @@ class Tool(SerializationByNameModel):
         return self.operation_mode in [self.OperationMode.REGULAR, self.OperationMode.HYBRID]
 
     def current_wait_list(self):
-        return ToolWaitList.objects.filter(tool=self, expired=False, deleted=False).order_by("date_entered")
+        return ToolWaitList.objects.filter(tool_id=self.id, expired=False, deleted=False).order_by("date_entered")
 
     def top_wait_list_entry(self):
         return self.current_wait_list().first()
@@ -2110,7 +2348,9 @@ class Tool(SerializationByNameModel):
         return content
 
     def has_reservation_rules(self):
-        return any([self.reservation_horizon, self.missed_reservation_threshold])
+        return any(
+            [self.reservation_horizon, self.missed_reservation_threshold, self.late_cancellation_reservation_threshold]
+        )
 
     def has_reservation_usage_rules(self):
         return any(
@@ -2150,17 +2390,22 @@ class Tool(SerializationByNameModel):
         return tool_questions
 
     def get_usage_questions(
-        self, questions_type: ToolUsageQuestionType, user: User = None, project: Project = None
-    ) -> MultiDynamicForms:
+        self, questions_type: ToolUsageQuestionType, user: User | None = None, project: Project | None = None
+    ) -> Optional[MultiDynamicForms]:
         from NEMO.widgets.dynamic_form import MultiDynamicForms
-        from NEMO.views.customization import ToolCustomization
+        from NEMO.views.customization import ToolControlCustomization
+        from NEMO.views.tool_control import get_current_reservation
 
-        is_post_usage = questions_type == ToolUsageQuestionType.POST
         initial_data = None
-        if is_post_usage:
+        if questions_type == ToolUsageQuestionType.PRE and user:
+            current_reservation = get_current_reservation(user, self)
+            if current_reservation:
+                if ToolControlCustomization.get_bool("tool_control_prefill_pre_usage_with_reservation_answers"):
+                    initial_data = current_reservation.question_data_json()
+        if questions_type == ToolUsageQuestionType.POST:
             current_usage = self.get_current_usage_event()
             if current_usage:
-                if ToolCustomization.get_bool("tool_control_prefill_post_usage_with_pre_usage_answers"):
+                if ToolControlCustomization.get_bool("tool_control_prefill_post_usage_with_pre_usage_answers"):
                     initial_data = current_usage.pre_run_data_json()
                 project = current_usage.project
                 user = current_usage.user
@@ -2173,13 +2418,18 @@ class Tool(SerializationByNameModel):
         else:
             raise ValueError(f"A {'project' if user else 'user'} must be provided for usage questions")
 
+    def get_qualification_reminder_days(self) -> List[int]:
+        if not self.qualification_reminder_days:
+            return []
+        return [int(days) for days in self.qualification_reminder_days.split(",") if days]
+
     def clean(self):
         errors = {}
         if self.parent_tool_id:
             if self.parent_tool_id == self.id:
                 errors["parent_tool"] = _("You cannot select the parent to be the tool itself.")
         else:
-            from NEMO.views.customization import ToolCustomization
+            from NEMO.views.customization import ToolCustomization, CoreFacilityCustomization
 
             if not self._category:
                 errors["_category"] = _("This field is required.")
@@ -2203,6 +2453,8 @@ class Tool(SerializationByNameModel):
                 errors["_requires_area_occupancy_minimum"] = _(
                     "You cannot have a minimum occupancy without requiring an active access record to that area"
                 )
+            if not self._core_facility_id and CoreFacilityCustomization.get_bool("core_facility_required_for_tools"):
+                errors["_core_facility"] = _("This field is required")
         if errors:
             raise ValidationError(errors)
 
@@ -2251,7 +2503,7 @@ class ToolUsageQuestions(models.Model):
     questions = models.TextField(help_text=_("This field will only accept JSON format"))
 
     def clean(self):
-        from NEMO.widgets.dynamic_form import validate_dynamic_form_model, PostUsageGroupQuestion, DynamicForm
+        from NEMO.widgets.dynamic_form import validate_dynamic_form_model
 
         # Validate questions JSON format
         if self.questions:
@@ -2292,6 +2544,9 @@ class ToolDocuments(BaseDocumentModel):
         tool_name = slugify(self.tool.name)
         return f"tool_documents/{tool_name}/{filename}"
 
+    def is_allowed(self, user: User):
+        return user.is_any_part_of_staff or user.qualifications.filter(tool=self.tool).exists()
+
     class Meta(BaseDocumentModel.Meta):
         verbose_name_plural = "Tool documents"
 
@@ -2299,6 +2554,9 @@ class ToolDocuments(BaseDocumentModel):
 class ToolQualificationGroup(SerializationByNameModel):
     name = models.CharField(max_length=CHAR_FIELD_MEDIUM_LENGTH, unique=True, help_text="The name of this tool group")
     tools = models.ManyToManyField(Tool, blank=False)
+    training_charge_tool = models.ForeignKey(
+        Tool, related_name="toolqualificationgroup_charge_set", on_delete=models.PROTECT
+    )
 
     def __str__(self):
         return self.name
@@ -2308,6 +2566,24 @@ class Qualification(BaseModel):
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     tool = models.ForeignKey(Tool, on_delete=models.CASCADE)
     qualified_on = models.DateField(default=datetime.date.today)
+
+    def get_last_use_and_expiration_date(self) -> Tuple[Optional[datetime.date], Optional[datetime.date]]:
+        # Returns the last tool use and the expiration date of this qualification (None if it doesn't expire)
+        tool = self.tool
+        last_tool_use, expiration_date = None, None
+        try:
+            # Last tool use cannot be before the last time they qualified
+            last_tool_use = max(
+                as_timezone(UsageEvent.objects.filter(user=self.user, tool=tool).latest("start").start).date(),
+                self.qualified_on,
+            )
+            if tool.qualification_expiration_days:
+                expiration_date = last_tool_use + timedelta(days=tool.qualification_expiration_days)
+        except UsageEvent.DoesNotExist:
+            # User never used the tool, use the qualification date
+            if tool.qualification_expiration_never_used_days:
+                expiration_date = self.qualified_on + timedelta(days=tool.qualification_expiration_never_used_days)
+        return last_tool_use, expiration_date
 
     class Meta:
         # For db consistency and compatibility with previous queries
@@ -2529,6 +2805,14 @@ class StaffCharge(BaseModel, CalendarDisplayMixin, BillableItemMixin):
     staff_member = models.ForeignKey(User, related_name="staff_charge_actor", on_delete=models.CASCADE)
     customer = models.ForeignKey(User, related_name="staff_charge_customer", on_delete=models.CASCADE)
     project = models.ForeignKey("Project", on_delete=models.CASCADE)
+    core_facility = models.ForeignKey(
+        CoreFacility,
+        null=True,
+        blank=True,
+        related_name="staff_charges",
+        help_text="The core facility this staff charge belongs to.",
+        on_delete=models.SET_NULL,
+    )
     start = models.DateTimeField(default=timezone.now)
     end = models.DateTimeField(null=True, blank=True)
     note = models.TextField(null=True, blank=True)
@@ -2543,7 +2827,13 @@ class StaffCharge(BaseModel, CalendarDisplayMixin, BillableItemMixin):
     )
 
     def clean(self):
+        from NEMO.views.customization import CoreFacilityCustomization
+
         errors = validate_waive_information(self)
+        if self.end and self.start and self.end < self.start:
+            errors["end"] = _("The end must be on or after the start")
+        if not self.core_facility_id and CoreFacilityCustomization.get_bool("core_facility_required_for_staff_charges"):
+            errors["core_facility"] = _("This field is required")
         if errors:
             raise ValidationError(errors)
 
@@ -2584,6 +2874,14 @@ class Area(MPTTModel):
         blank=True,
         help_text="An email will be sent to this address when users create or cancel reservations in the area or in children areas. A comma-separated list can be used.",
     )
+    core_facility = models.ForeignKey(
+        CoreFacility,
+        null=True,
+        blank=True,
+        related_name="areas",
+        help_text="The core facility this area belongs to.",
+        on_delete=models.SET_NULL,
+    )
 
     # Area permissions
     adjustment_request_reviewers = models.ManyToManyField(
@@ -2602,8 +2900,14 @@ class Area(MPTTModel):
     # Additional information
     area_calendar_color = models.CharField(
         max_length=9,
-        default="#88B7CD",
-        help_text="Color for tool reservations in calendar overviews",
+        default=CALENDAR_AREA_ACCESS_DEFAULT_COLOR,
+        help_text="Color for area access in calendar overviews",
+        validators=[color_hex_validator],
+    )
+    area_reservation_calendar_color = models.CharField(
+        max_length=9,
+        default=CALENDAR_AREA_RESERVATION_DEFAULT_COLOR,
+        help_text="Color for area reservations in calendar overviews",
         validators=[color_hex_validator],
     )
 
@@ -2655,6 +2959,12 @@ class Area(MPTTModel):
         null=True,
         blank=True,
         help_text='The amount of time (in minutes) that a area reservation may go unused before it is automatically marked as "missed" and hidden from the calendar. Usage can be from any user, regardless of who the reservation was originally created for. The cancellation process is triggered by a timed job on the web server.',
+    )
+    late_cancellation_reservation_threshold = models.PositiveIntegerField(
+        db_column="late_cancellation_reservation_threshold",
+        null=True,
+        blank=True,
+        help_text='The amount of time (in minutes) before its start time that a area reservation may be canceled before it is automatically marked as "missed" and hidden from the calendar. Usage can be from any user, regardless of who the reservation was originally created for. The cancellation process is triggered by a timed job on the web server.',
     )
     minimum_usage_block_time = models.PositiveIntegerField(
         db_column="minimum_usage_block_time",
@@ -2745,6 +3055,7 @@ class Area(MPTTModel):
             self.requires_reservation = False
             self.reservation_horizon = None
             self.missed_reservation_threshold = None
+            self.late_cancellation_reservation_threshold = None
             self.minimum_usage_block_time = None
             self.maximum_usage_block_time = None
             self.maximum_reservations_per_day = None
@@ -2843,6 +3154,43 @@ class Area(MPTTModel):
             reservation_questions = reservation_questions.filter(only_for_projects=None)
         return MultiDynamicForms(reservation_questions)
 
+    @property
+    def location(self):
+        return self.name
+
+    def get_calendar_usage_color(self):
+        from NEMO.views.customization import CalendarCustomization
+
+        if self.area_calendar_color.lower() == CALENDAR_AREA_ACCESS_DEFAULT_COLOR:
+            return CalendarCustomization.get("calendar_color_area_access_default")
+        return self.area_calendar_color
+
+    def get_calendar_reservation_color(self):
+        from NEMO.views.customization import CalendarCustomization
+
+        if self.area_reservation_calendar_color.lower() == CALENDAR_AREA_RESERVATION_DEFAULT_COLOR:
+            return CalendarCustomization.get("calendar_color_area_reservation_default")
+        return self.area_reservation_calendar_color
+
+    def get_calendar_missed_reservation_color(self):
+        from NEMO.views.customization import CalendarCustomization
+
+        return CalendarCustomization.get("calendar_color_area_missed_reservation")
+
+    def get_calendar_personal_schedule_color(self):
+        from NEMO.views.customization import CalendarCustomization
+
+        return CalendarCustomization.get("calendar_color_area_personal_schedule")
+
+    def clean(self):
+        from NEMO.views.customization import CoreFacilityCustomization
+
+        errors = {}
+        if not self.core_facility_id and CoreFacilityCustomization.get_bool("core_facility_required_for_areas"):
+            errors["core_facility"] = _("This field is required")
+        if errors:
+            raise ValidationError(errors)
+
 
 class AreaAccessRecord(BaseModel, CalendarDisplayMixin, BillableItemMixin):
     area = TreeForeignKey(Area, on_delete=models.CASCADE)
@@ -2864,6 +3212,8 @@ class AreaAccessRecord(BaseModel, CalendarDisplayMixin, BillableItemMixin):
 
     def clean(self):
         errors = validate_waive_information(self)
+        if self.end and self.start and self.end < self.start:
+            raise ValidationError({"end": "The end must be on or after the start"})
         if errors:
             raise ValidationError(errors)
 
@@ -2949,37 +3299,61 @@ class Project(SerializationByNameModel):
     project_types = models.ManyToManyField(ProjectType, blank=True)
     account = models.ForeignKey(
         Account,
-        help_text="All charges for this project will be billed to the selected account.",
+        help_text=_("All charges for this project will be billed to the selected account."),
         on_delete=models.CASCADE,
     )
     start_date = models.DateField(null=True, blank=True)
     discipline = models.ForeignKey(ProjectDiscipline, null=True, blank=True, on_delete=models.SET_NULL)
+    project_calendar_color = models.CharField(
+        max_length=9,
+        default=CALENDAR_PROJECT_DEFAULT_COLOR,
+        help_text=_("Color for project in calendar overviews (takes precedence over tool or area colors)"),
+        validators=[color_hex_validator],
+    )
     active = models.BooleanField(
         default=True,
-        help_text="Users may only charge to a project if it is active. Deactivate the project to block billable activity (such as tool usage and consumable check-outs).",
+        help_text=_(
+            "Users may only charge to a project if it is active. Deactivate the project to block billable activity (such as tool usage and consumable check-outs)."
+        ),
     )
     only_allow_tools = models.ManyToManyField(
-        Tool, blank=True, help_text="Selected tools will be the only ones allowed for this project."
+        Tool, blank=True, help_text=_("Selected tools will be the only ones allowed for this project.")
     )
     allow_consumable_withdrawals = models.BooleanField(
-        default=True, help_text="Uncheck this box if consumable withdrawals are forbidden under this project"
+        default=True, help_text=_("Uncheck this box if consumable withdrawals are forbidden under this project")
     )
     allow_staff_charges = models.BooleanField(
-        default=True, help_text="Uncheck this box if staff charges are forbidden for this project"
+        default=True, help_text=_("Uncheck this box if staff charges are forbidden for this project")
     )
 
     class Meta:
         ordering = ["name"]
 
-    def display_with_pis(self):
-        from NEMO.templatetags.custom_tags_and_filters import project_selection_display
-
+    def display_with_managers(self):
         managers = ", ".join([manager.get_name() for manager in self.manager_set.all()])
         managers = f" (PI{'s' if self.manager_set.count() > 1 else ''}: {managers})" if managers else ""
-        return f"{project_selection_display(self)}{managers}"
+        return f"{self.get_display()}{managers}"
 
     def display_with_status(self):
-        return f"{'[INACTIVE] ' if not self.active else ''}{self.name}"
+        return f"{'[INACTIVE] ' if not self.active else ''}{self.get_display()}"
+
+    def get_display(self) -> str:
+        from NEMO.views.customization import ProjectsAccountsCustomization
+
+        try:
+            template = Template(ProjectsAccountsCustomization.get("project_name_template"))
+            return template.render(Context({"project": self}, autoescape=False)).strip() or str(self)
+        except Exception as e:
+            models_logger.warning(f"Error rendering project title template for project {self.id}: {e}")
+            return str(self)
+
+    def display_with_status_and_managers(self):
+        return f"{'[INACTIVE] ' if not self.active else ''}{self.display_with_managers()}"
+
+    def get_calendar_color(self):
+        if self.project_calendar_color.lower() == CALENDAR_PROJECT_DEFAULT_COLOR:
+            return None
+        return self.project_calendar_color
 
     def validate_unique(self, exclude=None):
         super().validate_unique(exclude)
@@ -2999,6 +3373,9 @@ class ProjectDocuments(BaseDocumentModel):
 
         project_name = slugify(self.project.name)
         return f"project_documents/{project_name}/{filename}"
+
+    def is_allowed(self, user: User):
+        return user.is_any_part_of_staff or user.managed_projects.filter(project=self.project).exists()
 
     class Meta(BaseDocumentModel.Meta):
         verbose_name_plural = "Project documents"
@@ -3112,6 +3489,9 @@ class Reservation(BaseModel, CalendarDisplayMixin, BillableItemMixin):
     def duration(self):
         return self.end - self.start
 
+    def duration_rounded(self):
+        return timedelta(seconds=round(self.duration().total_seconds()))
+
     def duration_for_policy(self):
         # This method returns the duration that counts for policy checks.
         # i.e. reservation duration minus any time when the policy is off
@@ -3146,7 +3526,7 @@ class Reservation(BaseModel, CalendarDisplayMixin, BillableItemMixin):
         return colors
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
-        super().save(force_insert, force_update, using, update_fields)
+        super().save(force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields)
         deferred_related_models = getattr(self, "_deferred_related_models", None)
         if deferred_related_models:
             for deferred_related_model in deferred_related_models:
@@ -3188,6 +3568,8 @@ class Reservation(BaseModel, CalendarDisplayMixin, BillableItemMixin):
 
     def clean(self):
         errors = validate_waive_information(self)
+        if self.end and self.start and self.end < self.start:
+            raise ValidationError({"end": "The end must be on or after the start"})
         if errors:
             raise ValidationError(errors)
 
@@ -3248,6 +3630,7 @@ class UsageEvent(BaseModel, CalendarDisplayMixin, BillableItemMixin):
     end = models.DateTimeField(null=True, blank=True)
     has_ended = models.PositiveBigIntegerField(default=0)
     note = models.TextField(null=True, blank=True)
+    staff_charge = models.ForeignKey(StaffCharge, blank=True, null=True, on_delete=models.CASCADE)
     validated = models.BooleanField(default=False)
     validated_by = models.ForeignKey(
         User, null=True, blank=True, related_name="usage_event_validated_set", on_delete=models.CASCADE
@@ -3264,6 +3647,8 @@ class UsageEvent(BaseModel, CalendarDisplayMixin, BillableItemMixin):
 
     def clean(self):
         errors = validate_waive_information(self)
+        if self.end and self.start and self.end < self.start:
+            raise ValidationError({"end": "The end must be on or after the start"})
         if errors:
             raise ValidationError(errors)
 
@@ -3304,6 +3689,14 @@ class UsageEvent(BaseModel, CalendarDisplayMixin, BillableItemMixin):
 class Consumable(BaseModel):
     name = models.CharField(max_length=CHAR_FIELD_SMALL_LENGTH)
     category = models.ForeignKey("ConsumableCategory", blank=True, null=True, on_delete=models.CASCADE)
+    core_facility = models.ForeignKey(
+        CoreFacility,
+        null=True,
+        blank=True,
+        related_name="consumables",
+        help_text="The core facility this consumable belongs to.",
+        on_delete=models.SET_NULL,
+    )
     quantity = models.IntegerField(help_text="The number of items currently in stock.")
     reusable = models.BooleanField(
         default=False,
@@ -3336,13 +3729,20 @@ class Consumable(BaseModel):
         ordering = ["name"]
 
     def clean(self):
+        from NEMO.views.customization import CoreFacilityCustomization
+
+        errors = {}
+        if not self.core_facility_id and CoreFacilityCustomization.get_bool("core_facility_required_for_consumables"):
+            errors["core_facility"] = _("This field is required")
         if not self.reusable and (not self.reminder_threshold or not self.reminder_email):
-            raise ValidationError(
+            errors.update(
                 {
                     "reminder_threshold": "This field is required when the item is not reusable",
                     "reminder_email": "This field is required when the item is not reusable",
                 }
             )
+        if errors:
+            raise ValidationError(errors)
 
     def __str__(self):
         return self.name
@@ -3448,7 +3848,7 @@ class ConsumableWithdraw(BaseModel, BillableItemMixin):
         if self.quantity is not None and self.quantity < 1:
             errors["quantity"] = "Please specify a valid quantity of items to withdraw."
         if self.consumable_id:
-            if not self.consumable.reusable and self.quantity > self.consumable.quantity:
+            if not self.consumable.reusable and self.quantity is not None and self.quantity > self.consumable.quantity:
                 errors[NON_FIELD_ERRORS] = (
                     f'There are not enough "{self.consumable.name}". (The current quantity in stock is {str(self.consumable.quantity)}). Please order more as soon as possible.'
                 )
@@ -3585,10 +3985,10 @@ class RecurringConsumableCharge(BaseModel, RecurrenceMixin):
             )
         )
 
-    def next_charge(self, inc=False) -> datetime:
+    def next_charge(self, inc=False) -> datetime.datetime:
         return self.next_recurrence(inc)
 
-    def invalid_customer(self):
+    def invalid_customer_text(self):
         from NEMO.views.customization import RecurringChargesCustomization
 
         skip_customer = RecurringChargesCustomization.get_bool("recurring_charges_skip_customer_validation")
@@ -3600,7 +4000,7 @@ class RecurringConsumableCharge(BaseModel, RecurrenceMixin):
                     f"The facility access for this user expired on {format_datetime(self.customer.access_expiration)}"
                 )
 
-    def invalid_project(self):
+    def invalid_project_text(self):
         if self.project:
             if not self.project.active:
                 return "This project is inactive"
@@ -3687,7 +4087,7 @@ class RecurringConsumableCharge(BaseModel, RecurrenceMixin):
         if self.customer:
             display_attributes.append(str(self.customer))
         if self.project:
-            display_attributes.append(str(self.project))
+            display_attributes.append(self.project.get_display())
         return " - ".join(display_attributes)
 
     def __str__(self):
@@ -3814,6 +4214,12 @@ class Task(BaseModel):
 
     urgency = models.IntegerField(choices=Urgency.Choices)
     tool = models.ForeignKey(Tool, help_text="The tool that this task relates to.", on_delete=models.CASCADE)
+    title = models.CharField(
+        max_length=CHAR_FIELD_LARGE_LENGTH,
+        blank=True,
+        null=True,
+        help_text="A short summary of the problem. When set, this is shown instead of the full description in lists and status displays, and the full description is only shown once the task is expanded.",
+    )
     force_shutdown = models.BooleanField(
         default=None,
         help_text="Indicates that the tool this task relates to will be shutdown until the task is resolved.",
@@ -3873,6 +4279,14 @@ class Task(BaseModel):
             return TaskHistory.objects.filter(task_id=self.id).latest().status
         except TaskHistory.DoesNotExist:
             return None
+
+    def title_or_description(self) -> str:
+        """Returns the title if one was set, otherwise falls back to the full problem description."""
+        from NEMO.views.customization import ToolCustomization
+
+        if not ToolCustomization.get_bool("tool_problem_title_enabled"):
+            return self.problem_description
+        return self.title or self.problem_description
 
     def task_images(self):
         return TaskImages.objects.filter(task=self).order_by()
@@ -4093,7 +4507,8 @@ class ActivityHistory(BaseModel):
 
     class Meta:
         ordering = ["-date"]
-        verbose_name_plural = "activity histories"
+        verbose_name = "Administrative history"
+        verbose_name_plural = "Administrative histories"
 
     def __str__(self):
         if self.action:
@@ -4131,6 +4546,8 @@ class MembershipHistory(BaseModel):
     date = models.DateTimeField(default=timezone.now, help_text="The time at which the membership status was changed.")
     authorizer = models.ForeignKey(
         User,
+        null=True,
+        blank=True,
         help_text="The staff member who changed the membership status of the account, project, or user in question.",
         on_delete=models.CASCADE,
     )
@@ -4257,6 +4674,9 @@ class SafetyItemDocuments(BaseDocumentModel):
         item_name = slugify(self.safety_item.name)
         return f"safety_item/{item_name}/{filename}"
 
+    def is_allowed(self, user: User):
+        return True
+
     class Meta(BaseDocumentModel.Meta):
         verbose_name_plural = "Safety item documents"
 
@@ -4320,6 +4740,13 @@ class ContactInformationCategory(BaseCategory):
 
 class ContactInformation(BaseModel):
     name = models.CharField(max_length=CHAR_FIELD_MEDIUM_LENGTH)
+    user = models.OneToOneField(
+        to=User,
+        blank=True,
+        null=True,
+        help_text="Select a user to associate with this contact. When set, this contact information will be shown instead of the user information on pages like tool details.",
+        on_delete=models.CASCADE,
+    )
     title = models.CharField(max_length=CHAR_FIELD_MEDIUM_LENGTH, blank=True, null=True)
     image = models.ImageField(
         blank=True,
@@ -4334,13 +4761,6 @@ class ContactInformation(BaseModel):
         default=True,
         verbose_name="Mobile phone is SMS capable",
         help_text="Is the mobile phone capable of receiving text messages? If so, a link will be displayed for users to click to send a text message to the recipient when viewing the 'Contact information' page.",
-    )
-    user = models.OneToOneField(
-        to=User,
-        blank=True,
-        null=True,
-        help_text="Select a user to associate with this contact. When set, this contact information will be shown instead of the user information on pages like tool details.",
-        on_delete=models.CASCADE,
     )
 
     class Meta:
@@ -4552,6 +4972,30 @@ class ScheduledOutage(BaseModel):
         return str(self.title)
 
 
+class UnplannedOutage(BaseModel):
+    tool = models.ForeignKey(Tool, null=True, blank=True, on_delete=models.CASCADE)
+    resource = models.ForeignKey(Resource, null=True, blank=True, on_delete=models.CASCADE)
+    start = models.DateTimeField()
+    end = models.DateTimeField(blank=True, null=True)
+
+    def clean(self):
+        if not self.tool_id and not self.resource_id:
+            raise ValidationError("Either tool or resource must be specified for an unplanned outage")
+        if self.start and self.end and self.start >= self.end:
+            raise ValidationError(
+                {
+                    "start": "Outage start time ("
+                    + format_datetime(self.start)
+                    + ") must be before the end time ("
+                    + format_datetime(self.end)
+                    + ")."
+                }
+            )
+
+    def __str__(self):
+        return f"{self.tool or self.resource} unplanned outage"
+
+
 class News(BaseModel):
     title = models.CharField(max_length=CHAR_FIELD_MEDIUM_LENGTH)
     pinned = models.BooleanField(
@@ -4730,7 +5174,7 @@ class ToolUsageCounter(BaseModel):
                 question_name = f"tool_{question_type}_usage_question"
                 question_data_name = getattr(self, question_name)
                 tool_questions = ToolUsageQuestions.objects.filter(enabled=True, questions_type=question_type).filter(
-                    Q(only_for_tools=None) | Q(only_for_tools__in=[self.tool_or_parent_id()])
+                    Q(only_for_tools=None) | Q(only_for_tools__in=[self.tool.tool_or_parent_id()])
                 )
                 dynamic_form = MultiDynamicForms(tool_questions).merged_dynamic_forms
                 error = self.clean_counter_question(dynamic_form, question_data_name, question_type)
@@ -4961,8 +5405,8 @@ class AdjustmentRequest(BaseModel):
             if self.is_start_time_adjustable() or self.is_end_time_adjustable() or self.is_quantity_adjustable():
                 result += "\n"
             result += "- project: "
-            result += self.get_original_project().name if self.get_original_project() else ""
-            result += " -> " + self.new_project.name
+            result += self.get_original_project().get_display() if self.get_original_project() else ""
+            result += " -> " + self.new_project.get_display()
         if self.is_waivable():
             result += "- the charge will be waived entirely"
         return result
@@ -5054,7 +5498,10 @@ class AdjustmentRequest(BaseModel):
         # list of reviewers is empty, send/show to all facility managers
         facility_managers = User.objects.filter(is_active=True, is_facility_manager=True)
         if self.item_tool:
-            tool_reviewers = self.item_tool._adjustment_request_reviewers.filter(is_active=True)
+            tool = self.item_tool
+            if self.item_tool.parent_tool_id:
+                tool = self.item_tool.parent_tool
+            tool_reviewers = tool._adjustment_request_reviewers.filter(is_active=True)
             return tool_reviewers or facility_managers
         if self.item_area:
             area_reviewers = self.item_area.adjustment_request_reviewers.filter(is_active=True)
@@ -5084,7 +5531,7 @@ class AdjustmentRequest(BaseModel):
                         self.item.start = self.new_start
                     if self.new_end:
                         self.item.end = self.new_end
-                elif self.new_quantity:
+                elif self.new_quantity is not None:
                     self.item.quantity = self.new_quantity
                 # But changing the project can happen in addition to changed times and quantity
                 if self.new_project:
@@ -5155,6 +5602,11 @@ class AdjustmentRequest(BaseModel):
                 if item_att is not None:
                     setattr(self, f"original_{att}", item_att)
             tool_id = getattr(self.item, "tool_id", None)
+            if not tool_id:
+                # try usage event tool id (from consumable withdrawal)
+                usage_event = getattr(self.item, "usage_event", None)
+                if usage_event:
+                    tool_id = usage_event.tool_id
             area_id = getattr(self.item, "area_id", None)
             if tool_id:
                 self.item_tool_id = tool_id
@@ -5174,8 +5626,31 @@ class AdjustmentRequest(BaseModel):
                 already_adjusted = already_adjusted.exclude(pk=self.pk)
             if already_adjusted.exists():
                 raise ValidationError({NON_FIELD_ERRORS: _("There is already an adjustment request for this charge")})
-            if self.new_start and self.new_end and self.new_start > self.new_end:
-                raise ValidationError({"new_end": _("The end must be later than the start")})
+            if not self.waive:
+                now = timezone.now()
+                item_start = getattr(item, "start", None)
+                item_end = getattr(item, "end", None)
+                time_errors = {}
+                if self.new_start and self.new_start >= now:
+                    time_errors["new_start"] = _("The new start must be in the past")
+                if self.new_end and self.new_end >= now:
+                    time_errors["new_end"] = _("The new end must be in the past")
+                if self.new_start and self.new_end:
+                    if self.new_start >= self.new_end:
+                        time_errors["new_end"] = _("The end must be later than the start")
+                elif self.new_start and item_end and self.new_start >= item_end:
+                    time_errors["new_start"] = _("The new start must be before the current end")
+                elif self.new_end and item_start and self.new_end <= item_start:
+                    time_errors["new_end"] = _("The new end must be after the current start")
+                if time_errors:
+                    raise ValidationError(time_errors)
+            if self.new_quantity == 0:
+                from NEMO.views.customization import AdjustmentRequestsCustomization
+
+                message = "The quantity must be greater than zero"
+                if AdjustmentRequestsCustomization.get_bool("adjustment_requests_waive_consumable_withdrawal_enabled"):
+                    message += ", otherwise please request to waive the charge"
+                raise ValidationError({"new_quantity": message})
 
     class Meta:
         ordering = ["-creation_time"]
@@ -5348,6 +5823,26 @@ def auto_update_file_on_chemical_change(sender, instance: Chemical, **kwargs):
     return update_media_file_on_model_update(instance, "document")
 
 
+@receiver(models.signals.post_save, sender=Tool)
+def track_tool_operational_status(sender, instance: Tool, **kwargs):
+    tool_down = UnplannedOutage.objects.filter(tool=instance, end__isnull=True).first()
+    if not instance.operational and not tool_down:
+        UnplannedOutage.objects.create(tool=instance, start=timezone.now())
+    if instance.operational and tool_down:
+        tool_down.end = timezone.now()
+        tool_down.save()
+
+
+@receiver(models.signals.post_save, sender=Resource)
+def track_resource_availability_status(sender, instance: Resource, **kwargs):
+    resource_down = UnplannedOutage.objects.filter(resource=instance, end__isnull=True).first()
+    if not instance.available and not resource_down:
+        UnplannedOutage.objects.create(resource=instance, start=timezone.now())
+    if instance.available and resource_down:
+        resource_down.end = timezone.now()
+        resource_down.save()
+
+
 class StaffKnowledgeBaseCategory(BaseCategory):
     class Meta(BaseCategory.Meta):
         verbose_name_plural = "Staff knowledge base categories"
@@ -5382,6 +5877,9 @@ class StaffKnowledgeBaseItemDocuments(BaseDocumentModel):
 
         item_name = slugify(self.item.name)
         return f"{MEDIA_PROTECTED}/knowledge_base/{item_name}/{filename}"
+
+    def is_allowed(self, user: User):
+        return user.is_any_part_of_staff
 
     class Meta(BaseDocumentModel.Meta):
         verbose_name_plural = "Staff knowledge base item documents"
@@ -5422,6 +5920,9 @@ class UserKnowledgeBaseItemDocuments(BaseDocumentModel):
         item_name = slugify(self.item.name)
         return f"knowledge_base/{item_name}/{filename}"
 
+    def is_allowed(self, user: User):
+        return True
+
     class Meta(BaseDocumentModel.Meta):
         verbose_name_plural = "User knowledge base item documents"
 
@@ -5441,6 +5942,23 @@ class ToolCredentials(BaseModel):
         ordering = ["-tool__visible", "tool___category", "tool__name"]
         verbose_name = "Tool credentials"
         verbose_name_plural = "Tool credentials"
+
+
+class Policy(models.Model):
+    """This is a non managed model only used to hold policy block permissions"""
+
+    class Meta:
+        managed = False
+        default_permissions = ()
+        permissions = [
+            ("block_create_reservations", "Cannot create reservations"),
+            ("block_create_outages", "Cannot create outages"),
+            ("block_enable_tools", "Cannot enable tools"),
+            ("block_enter_any_areas", "Cannot enter any areas"),
+            ("block_bill_projects", "Cannot bill projects"),
+            ("block_qualify_on_tools", "Cannot qualify user on tools"),
+            ("block_add_physical_access_levels", "Cannot add physical access levels to user"),
+        ]
 
 
 class EmailLog(BaseModel):

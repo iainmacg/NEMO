@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import date, timedelta
 from time import sleep
 
 from django.test import TransactionTestCase
@@ -61,6 +61,62 @@ class ReservationTestCase(NEMOTestCaseMixin, TransactionTestCase):
         self.assertEqual(
             EmailLog.objects.filter(to=self.consumer.email, subject__startswith=f"[{self.tool.name}]").first().subject,
             email_subject(self.tool, minutes, start_of_freed_time),
+        )
+
+    def test_cancel_reservation_inactive_or_expired_users_not_notified(self):
+        # Users who are inactive or whose access has expired should not receive
+        # the freed time notification even if they have subscribed to it.
+        inactive_user = User.objects.create(
+            username="inactive",
+            first_name="In",
+            last_name="Active",
+            training_required=False,
+            email="inactive@test.com",
+            is_active=False,
+        )
+        inactive_user.qualifications.add(self.tool)
+        inactive_user.projects.add(self.project)
+        expired_user = User.objects.create(
+            username="expired",
+            first_name="Ex",
+            last_name="Pired",
+            training_required=False,
+            email="expired@test.com",
+            access_expiration=date.today() - timedelta(days=1),
+        )
+        expired_user.qualifications.add(self.tool)
+        expired_user.projects.add(self.project)
+        # All three users subscribe to the tool's freed time notifications
+        for user in (self.consumer, inactive_user, expired_user):
+            prefs: UserPreferences = user.get_preferences()
+            prefs.tool_freed_time_notifications.set([self.tool])
+        # default is 7 days in the future, more than 2 hours
+        start = timezone.now() + timedelta(hours=1)
+        end = start + timedelta(hours=3)
+        reservation = Reservation.objects.create(
+            tool=self.tool,
+            start=start,
+            end=end,
+            user=self.staff,
+            creator=self.staff,
+            project=self.project,
+            short_notice=False,
+        )
+        self.login_as(self.staff)
+        self.client.post(reverse("cancel_reservation", args=[reservation.id]), follow=True)
+        # Wait a second since the freed time notification is asynchronous
+        sleep(0.5)
+        self.assertTrue(Reservation.objects.get(id=reservation.id).cancelled, True)
+        # The active consumer should have received the notification (sanity check)
+        self.assertTrue(
+            EmailLog.objects.filter(to=self.consumer.email, subject__startswith=f"[{self.tool.name}]").exists()
+        )
+        # The inactive user and the user with expired access should not have received anything
+        self.assertFalse(
+            EmailLog.objects.filter(to=inactive_user.email, subject__startswith=f"[{self.tool.name}]").exists()
+        )
+        self.assertFalse(
+            EmailLog.objects.filter(to=expired_user.email, subject__startswith=f"[{self.tool.name}]").exists()
         )
 
     def test_cancel_reservation_same_user(self):
@@ -423,16 +479,22 @@ class ReservationTestCase(NEMOTestCaseMixin, TransactionTestCase):
             project=self.project,
         )
         self.login_as(consumer_2)
+        now_before = timezone.now()
         self.client.post(reverse("disable_tool", args=[self.tool.id]), follow=True)
-        # Wait a second since the freed time notification is asynchronous
+        # Wait half a second since the freed time notification is asynchronous
         sleep(0.5)
         # This time it should work
-        minutes = (timezone.now() - reservation.end).total_seconds() // 60
-        start_of_freed_time = reservation.end + timedelta(minutes=minutes)
-        self.assertEqual(
-            EmailLog.objects.filter(to=self.consumer.email, subject__startswith=f"[{self.tool.name}]").first().subject,
-            email_subject(self.tool, minutes, start_of_freed_time),
+        # Use now_before to limit time difference between the post and the email notification
+        # So check for both on-time and one minute late (in case it was 59.5 seconds and the email was sent at 00:00)
+        minutes = (now_before - reservation.end).total_seconds() // 60
+        actual_subject = (
+            EmailLog.objects.filter(to=self.consumer.email, subject__startswith=f"[{self.tool.name}]").first().subject
         )
+        possible_subjects = [
+            email_subject(self.tool, minutes + offset, reservation.end + timedelta(minutes=minutes + offset))
+            for offset in range(2)
+        ]
+        self.assertIn(actual_subject, possible_subjects)
 
     def test_notify_next_reservation_notification_first_one(self):
         consumer_2 = User.objects.create(
@@ -490,17 +552,21 @@ class ReservationTestCase(NEMOTestCaseMixin, TransactionTestCase):
             project=self.project,
         )
         self.login_as(consumer_2)
+        now_before = timezone.now()
         self.client.post(reverse("disable_tool", args=[self.tool.id]), follow=True)
         # Wait a second since the freed time notification is asynchronous
         sleep(0.5)
         # This time it should work, but only for the first one (consumer)
         self.assertFalse(EmailLog.objects.filter(to=self.staff.email).exists())
-        minutes = (timezone.now() - reservation.end).total_seconds() // 60
-        start_of_freed_time = reservation.end + timedelta(minutes=minutes)
-        self.assertEqual(
-            EmailLog.objects.filter(to=self.consumer.email, subject__startswith=f"[{self.tool.name}]").first().subject,
-            email_subject(self.tool, minutes, start_of_freed_time),
+        minutes = (now_before - reservation.end).total_seconds() // 60
+        actual_subject = (
+            EmailLog.objects.filter(to=self.consumer.email, subject__startswith=f"[{self.tool.name}]").first().subject
         )
+        possible_subjects = [
+            email_subject(self.tool, minutes + offset, reservation.end + timedelta(minutes=minutes + offset))
+            for offset in range(2)
+        ]
+        self.assertIn(actual_subject, possible_subjects)
 
     def test_notify_next_reservation_notifications_not_enabled(self):
         # turn them off
@@ -636,17 +702,20 @@ class ReservationTestCase(NEMOTestCaseMixin, TransactionTestCase):
             project=self.project,
         )
         self.login_as(consumer_2)
+        now_before = timezone.now()
         self.client.post(reverse("disable_tool", args=[self.tool.id]), follow=True)
         # Wait a second since the freed time notification is asynchronous
-        sleep(0.2)
-        minutes = (timezone.now() - reservation.end).total_seconds() // 60
-        sleep(0.2)
+        sleep(0.5)
         # This time it should work
-        start_of_freed_time = reservation.end + timedelta(minutes=minutes)
-        self.assertEqual(
-            EmailLog.objects.filter(to=self.consumer.email, subject__startswith=f"[{self.tool.name}]").first().subject,
-            email_subject(self.tool, minutes, start_of_freed_time),
+        minutes = (now_before - reservation.end).total_seconds() // 60
+        actual_subject = (
+            EmailLog.objects.filter(to=self.consumer.email, subject__startswith=f"[{self.tool.name}]").first().subject
         )
+        possible_subjects = [
+            email_subject(self.tool, minutes + offset, reservation.end + timedelta(minutes=minutes + offset))
+            for offset in range(2)
+        ]
+        self.assertIn(actual_subject, possible_subjects)
 
 
 def email_subject(tool, minutes, date):

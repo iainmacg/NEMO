@@ -9,6 +9,7 @@ from django.contrib import admin
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.views import LogoutView
 from django.contrib.staticfiles.storage import staticfiles_storage
+from django.http import HttpResponse
 from django.urls import path, re_path
 from django.views.decorators.clickjacking import xframe_options_sameorigin
 from django.views.generic import RedirectView
@@ -75,55 +76,59 @@ def sort_urls(url_path):
 
 # REST API URLs
 router = routers.DefaultRouter()
-router.register(r"account_types", api.AccountTypeViewSet)
-router.register(r"accounts", api.AccountViewSet)
-router.register(r"adjustment_requests", api.AdjustmentRequestViewSet)
-router.register(r"alert_categories", api.AlertCategoryViewSet)
-router.register(r"alerts", api.AlertViewSet)
-router.register(r"area_access_records", api.AreaAccessRecordViewSet)
-router.register(r"areas", api.AreaViewSet)
-router.register(r"auth_groups", api.GroupViewSet)
-router.register(r"auth_permissions", api.PermissionViewSet)
-router.register(r"billing", api.BillingViewSet, basename="billing")
-router.register(r"buddy_requests", api.BuddyRequestViewSet)
-router.register(r"configurations", api.ConfigurationViewSet)
-router.register(r"consumable_categories", api.ConsumableCategoryViewSet)
-router.register(r"consumable_withdrawals", api.ConsumableWithdrawViewSet)
-router.register(r"consumables", api.ConsumableViewSet)
-router.register(r"content_types", api.ContentTypeViewSet)
-router.register(r"customizations", api.CustomizationViewSet)
-router.register(r"interlock_card_categories", api.InterlockCardCategoryViewSet)
-router.register(r"interlock_cards", api.InterlockCardViewSet)
-router.register(r"interlocks", api.InterlockViewSet)
-router.register(r"membership_history", api.MembershipHistoryViewSet)
-router.register(r"physical_access_levels", api.PhysicalAccessLevelViewSet)
-router.register(r"temporary_physical_access_requests", api.TemporaryPhysicalAccessRequestViewSet)
-router.register(r"project_disciplines", api.ProjectDisciplineViewSet)
-router.register(r"project_types", api.ProjectTypeViewSet)
-router.register(r"projects", api.ProjectViewSet)
-router.register(r"qualifications", api.QualificationViewSet)
-router.register(r"recurring_consumable_charges", api.RecurringConsumableChargesViewSet)
-router.register(r"reservations", api.ReservationViewSet)
-router.register(r"reservation_configuration_options", api.ConfigurationOptionViewSet)
-router.register(r"reservation_questions", api.ReservationQuestionsViewSet)
-router.register(r"resources", api.ResourceViewSet)
-router.register(r"scheduled_outages", api.ScheduledOutageViewSet)
-router.register(r"staff_assistance_requests", api.StaffAssistanceRequestViewSet)
-router.register(r"staff_charges", api.StaffChargeViewSet)
-router.register(r"tasks", api.TaskViewSet)
-router.register(r"tools", api.ToolViewSet)
-router.register(r"tool_comments", api.ToolCommentViewSet)
-router.register(r"tool_credentials", api.ToolCredentialsViewSet)
-router.register(r"tool_status", api.ToolStatusViewSet, basename="tool_status")
-router.register(r"tool_usage_counters", api.ToolUsageCounterViewSet)
-router.register(r"tool_usage_questions", api.ToolUsageQuestionsViewSet)
-router.register(r"training_sessions", api.TrainingSessionViewSet)
-router.register(r"usage_events", api.UsageEventViewSet)
-router.register(r"users", api.UserViewSet)
-router.register(r"user_documents", api.UserDocumentsViewSet)
-router.register(r"user_calendar_tool_lists", api.UserCalendarToolListViewSet)
-router.register(r"user_preferences", api.UserPreferencesViewSet)
-router.register(r"metadata", api.MetadataViewSet, basename="metadata")
+router.register("account_types", api.AccountTypeViewSet)
+router.register("accounts", api.AccountViewSet)
+router.register("adjustment_requests", api.AdjustmentRequestViewSet)
+router.register("alert_categories", api.AlertCategoryViewSet)
+router.register("alerts", api.AlertViewSet)
+router.register("area_access_records", api.AreaAccessRecordViewSet)
+router.register("areas", api.AreaViewSet)
+router.register("auth_groups", api.GroupViewSet)
+router.register("auth_permissions", api.PermissionViewSet)
+router.register("billing", api.BillingViewSet, basename="billing")
+router.register("buddy_requests", api.BuddyRequestViewSet)
+router.register("configurations", api.ConfigurationViewSet)
+router.register("consumable_categories", api.ConsumableCategoryViewSet)
+router.register("consumable_withdrawals", api.ConsumableWithdrawViewSet)
+router.register("consumables", api.ConsumableViewSet)
+router.register("content_types", api.ContentTypeViewSet)
+router.register("customizations", api.CustomizationViewSet)
+router.register("interlock_card_categories", api.InterlockCardCategoryViewSet)
+router.register("interlock_cards", api.InterlockCardViewSet)
+router.register("interlocks", api.InterlockViewSet)
+router.register("membership_history", api.MembershipHistoryViewSet)
+router.register("physical_access_levels", api.PhysicalAccessLevelViewSet)
+router.register("temporary_physical_access_requests", api.TemporaryPhysicalAccessRequestViewSet)
+router.register("project_disciplines", api.ProjectDisciplineViewSet)
+router.register("project_types", api.ProjectTypeViewSet)
+router.register("projects", api.ProjectViewSet)
+router.register("qualifications", api.QualificationViewSet)
+router.register("recurring_consumable_charges", api.RecurringConsumableChargesViewSet)
+router.register("reservations", api.ReservationViewSet)
+router.register("reservation_configuration_options", api.ConfigurationOptionViewSet)
+router.register("reservation_questions", api.ReservationQuestionsViewSet)
+router.register("resource_categories", api.ResourceCategoryViewSet)
+router.register("resources", api.ResourceViewSet)
+router.register("scheduled_outages", api.ScheduledOutageViewSet)
+router.register("staff_assistance_requests", api.StaffAssistanceRequestViewSet)
+router.register("staff_charges", api.StaffChargeViewSet)
+router.register("tasks", api.TaskViewSet)
+router.register("tools", api.ToolViewSet)
+router.register("tool_comments", api.ToolCommentViewSet)
+router.register("tool_credentials", api.ToolCredentialsViewSet)
+router.register("tool_qualification_groups", api.ToolQualificationGroupViewSet)
+router.register("tool_status", api.ToolStatusViewSet, basename="tool_status")
+router.register("tool_usage_counters", api.ToolUsageCounterViewSet)
+router.register("tool_usage_questions", api.ToolUsageQuestionsViewSet)
+router.register("training_sessions", api.TrainingSessionViewSet)
+router.register("unplanned_outages", api.UnplannedOutageViewSet)
+router.register("usage_events", api.UsageEventViewSet)
+router.register("users", api.UserViewSet)
+router.register("user_types", api.UserTypeViewSet)
+router.register("user_documents", api.UserDocumentsViewSet)
+router.register("user_calendar_tool_lists", api.UserCalendarToolListViewSet)
+router.register("user_preferences", api.UserPreferencesViewSet)
+router.register("metadata", api.MetadataViewSet, basename="metadata")
 router.registry.sort(key=sort_urls)
 
 reservation_item_types = f'(?P<item_type>{"|".join(ReservationItemType.values())})'
@@ -157,6 +162,8 @@ for app in apps.get_app_configs():
 
 # The order matters for some tests to run properly
 urlpatterns += [
+    # Health check
+    path("health/", lambda request: HttpResponse("OK"), name="health_check"),
     # Authentication & error pages:
     path("login/", authentication.login_user, name="login"),
     path(
@@ -178,7 +185,7 @@ urlpatterns += [
     ),
     path("get_projects_for_self/", get_projects.get_projects_for_self, name="get_projects_for_self"),
     # User Profile:
-    path("user/view_user/<int:user_id>/", users.view_user, name="view_user"),
+    path("user/user_profile/", users.user_profile, name="user_profile"),
     # Tool control:
     # This tool_control URL is needed to be able to reverse when choosing items on mobile using next_page.
     # (see choose_item.html for details)
@@ -188,7 +195,7 @@ urlpatterns += [
     re_path(
         r"^tool_usage_questions/(?P<tool_id>\d+)/"
         + tool_usage_question_types
-        + "/(?P<user_id>\d+)/(?P<project_id>\d+)/(?P<virtual_inputs>(true|false))/$",
+        + r"/(?P<user_id>\d+)/(?P<project_id>\d+)/(?P<virtual_inputs>(true|false))/$",
         tool_control.tool_usage_questions,
         name="tool_usage_questions",
     ),
@@ -321,7 +328,7 @@ urlpatterns += [
     path("task_update_form/<int:task_id>/", tasks.task_update_form, name="task_update_form"),
     path("task_resolution_form/<int:task_id>/", tasks.task_resolution_form, name="task_resolution_form"),
     # Calendar:
-    re_path(r"^calendar/" + reservation_item_types + "/(?P<item_id>\d+)/$", calendar.calendar, name="calendar"),
+    re_path(r"^calendar/" + reservation_item_types + r"/(?P<item_id>\d+)/$", calendar.calendar, name="calendar"),
     path("calendar/", calendar.calendar, name="calendar"),
     path("event_feed/", calendar.event_feed, name="event_feed"),
     path("create_reservation/", calendar.create_reservation, name="create_reservation"),
@@ -445,7 +452,7 @@ urlpatterns += [
     path("send_email/", email.send_email, name="send_email"),
     path("email_broadcast/", email.email_broadcast, name="email_broadcast"),
     re_path(
-        r"^email_broadcast/(?P<audience>tool|area|account|project|project-pis|account-managers|user|tool-reservation)/$",
+        r"^email_broadcast/(?P<audience>tool|area|account|project|project-pis|account-managers|user|tool-reservation|tool-categories)/$",
         email.email_broadcast,
         name="email_broadcast",
     ),
@@ -555,25 +562,25 @@ urlpatterns += [
     # Mobile:
     re_path(r"^choose_item/then/(?P<next_page>view_calendar|tool_control)/$", mobile.choose_item, name="choose_item"),
     re_path(
-        r"^new_reservation/" + reservation_item_types + "/(?P<item_id>\d+)/$",
+        r"^new_reservation/" + reservation_item_types + r"/(?P<item_id>\d+)/$",
         mobile.new_reservation,
         name="new_reservation",
     ),
     re_path(
         r"^new_reservation/"
         + reservation_item_types
-        + "/(?P<item_id>\d+)/(?P<date>20\d\d-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01]))/$",
+        + r"/(?P<item_id>\d+)/(?P<date>20\d\d-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01]))/$",
         mobile.new_reservation,
         name="new_reservation",
     ),
     path("make_reservation/", mobile.make_reservation, name="make_reservation"),
     re_path(
-        r"^view_calendar/" + reservation_item_types + "/(?P<item_id>\d+)/$", mobile.view_calendar, name="view_calendar"
+        r"^view_calendar/" + reservation_item_types + r"/(?P<item_id>\d+)/$", mobile.view_calendar, name="view_calendar"
     ),
     re_path(
         r"^view_calendar/"
         + reservation_item_types
-        + "/(?P<item_id>\d+)/(?P<date>20\d\d-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01]))/$",
+        + r"/(?P<item_id>\d+)/(?P<date>20\d\d-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01]))/$",
         mobile.view_calendar,
         name="view_calendar",
     ),
@@ -721,6 +728,7 @@ if settings.ALLOW_CONDITIONAL_URLS:
         path("users/", users.users, name="users"),
         re_path(r"^user/(?P<user_id>\d+|new)/$", users.create_or_modify_user, name="create_or_modify_user"),
         path("users/search/", users.user_search, name="user_search"),
+        path("users/<int:user_id>/", users.view_user, name="view_user"),
         path("deactivate_user/<int:user_id>/", users.deactivate, name="deactivate_user"),
         path("reset_password/<int:user_id>/", users.reset_password, name="reset_password"),
         path("unlock_account/<int:user_id>/", users.unlock_account, name="unlock_account"),

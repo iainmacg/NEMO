@@ -42,7 +42,14 @@ from NEMO.views.consumables import (
     make_withdrawal_success_message,
     self_checkout,
 )
-from NEMO.views.customization import ApplicationCustomization, ToolCustomization, UserCustomization
+from NEMO.views.customization import (
+    ApplicationCustomization,
+    CalendarCustomization,
+    RemoteWorkCustomization,
+    ToolControlCustomization,
+    ToolCustomization,
+    UserCustomization,
+)
 from NEMO.views.get_projects import get_projects
 from NEMO.views.tasks import save_task
 from NEMO.views.tool_control import (
@@ -51,6 +58,7 @@ from NEMO.views.tool_control import (
     interlock_error,
     save_comment,
     tool_configuration,
+    tool_usage_questions,
 )
 
 
@@ -154,7 +162,11 @@ def do_disable_tool(request, tool_id):
     current_usage_event = tool.get_current_usage_event()
     staff_shortening = request.POST.get("shorten", False)
     shorten_reservation(
-        user=current_usage_event.user, item=tool, new_end=timezone.now() + downtime, force=staff_shortening
+        user=customer,
+        reservation_user=current_usage_event.user,
+        item=tool,
+        new_end=timezone.now() + downtime,
+        force=staff_shortening,
     )
 
     # End the current usage event for the tool and save it.
@@ -365,6 +377,15 @@ def kiosk_tool_configuration(request):
 
 @login_required
 @permission_required("NEMO.kiosk")
+@require_GET
+def kiosk_tool_usage_questions(
+    request, tool_id: int, question_type: str, user_id: int, project_id: int, virtual_inputs: str = None
+):
+    return tool_usage_questions(request, tool_id, question_type, user_id, project_id, virtual_inputs)
+
+
+@login_required
+@permission_required("NEMO.kiosk")
 @require_POST
 def tool_reservation(request, tool_id, user_id, back):
     tool = Tool.objects.get(id=tool_id, visible=True)
@@ -377,6 +398,7 @@ def tool_reservation(request, tool_id, user_id, back):
         "project": project,
         "customer": customer,
         "back": back,
+        "calendar_slot_duration": CalendarCustomization.get_slot_resolution_minutes(),
         "tool_reservation_times": list(
             Reservation.objects.filter(
                 cancelled=False, missed=False, shortened=False, tool=tool, start__gte=timezone.now()
@@ -426,11 +448,10 @@ def choices(request):
     expiration_danger = UserCustomization.get_int("user_access_expiration_banner_danger")
     if customer.access_expiration and (expiration_warning or expiration_danger):
         access_expiration_datetime = datetime.combine(customer.access_expiration, time.min).astimezone()
-        if access_expiration_datetime >= timezone.now():
-            if expiration_warning and access_expiration_datetime < timezone.now() + timedelta(days=expiration_warning):
-                show_access_expiration_banner = "warning"
-            if expiration_danger and access_expiration_datetime < timezone.now() + timedelta(days=expiration_danger):
-                show_access_expiration_banner = "danger"
+        if expiration_warning and access_expiration_datetime < timezone.now() + timedelta(days=expiration_warning):
+            show_access_expiration_banner = "warning"
+        if expiration_danger and access_expiration_datetime < timezone.now() + timedelta(days=expiration_danger):
+            show_access_expiration_banner = "danger"
 
     dictionary = {
         "show_access_expiration_banner": show_access_expiration_banner,
@@ -470,6 +491,7 @@ def tool_information(request, tool_id, user_id, back):
     virtual_inputs = request.GET.get("virtual_inputs") != "false"
     tool = Tool.objects.get(id=tool_id, visible=True)
     customer = User.objects.get(id=user_id)
+    current_usage_event = tool.get_current_usage_event()
     wait_list = tool.current_wait_list()
     user_wait_list_entry = wait_list.filter(user=user_id).first()
     user_wait_list_position = (
@@ -485,7 +507,7 @@ def tool_information(request, tool_id, user_id, back):
         else 0
     )
     tool_credentials = []
-    if ToolCustomization.get_bool("tool_control_show_tool_credentials") and (
+    if ToolControlCustomization.get_bool("tool_control_show_tool_credentials") and (
         customer.is_staff_on_tool(tool) or customer.is_facility_manager
     ):
         if customer.is_facility_manager:
@@ -506,38 +528,39 @@ def tool_information(request, tool_id, user_id, back):
             post_usage_questions.render(virtual_inputs=virtual_inputs) if post_usage_questions else ""
         ),
         "back": back,
-        "tool_control_show_task_details": ToolCustomization.get_bool("tool_control_show_task_details"),
+        "tool_control_show_task_details": ToolControlCustomization.get_bool("tool_control_show_task_details"),
         "wait_list_position": user_wait_list_position,  # 0 if not in wait list
         "wait_list": wait_list,
         "show_wait_list": (
             tool.allow_wait_list()
             and (
-                not (
-                    tool.get_current_usage_event().operator.id == customer.id
-                    or tool.get_current_usage_event().user.id == customer.id
-                )
-                if tool.in_use()
+                not (current_usage_event.operator_id == customer.id or current_usage_event.user_id == customer.id)
+                if current_usage_event
                 else wait_list.count() > 0
             )
         ),
     }
 
+    reservation_user = customer
+    if current_usage_event and current_usage_event.operator_id == customer.id:
+        reservation_user = current_usage_event.user
     current_reservation = Reservation.objects.filter(
         start__lt=timezone.now(),
         end__gt=timezone.now(),
         cancelled=False,
         missed=False,
         shortened=False,
-        user=customer,
+        user=reservation_user,
         tool=tool,
     ).last()
     if current_reservation:
+        dictionary["reservation_project"] = current_reservation.project
         remaining_reservation_duration = int((current_reservation.end - timezone.now()).total_seconds() / 60)
         # We don't need to bother telling the user their reservation will be shortened if there's less than two minutes left.
         # Staff are exempt from reservation shortening.
         if remaining_reservation_duration > 2:
             dictionary["remaining_reservation_duration"] = remaining_reservation_duration
-        if ToolCustomization.get_bool("tool_control_note_copy_reservation"):
+        if ToolControlCustomization.get_bool("tool_control_note_copy_reservation"):
             dictionary["reservation_note"] = current_reservation.note
 
     return render(request, "kiosk/tool_information.html", dictionary)
@@ -606,6 +629,10 @@ def report_problem(request):
     customer = User.objects.get(id=request.POST["customer_id"])
     back = request.POST["back"]
 
+    if ToolCustomization.get_bool("tool_problem_hide_for_non_staff") and not customer.is_any_part_of_staff:
+        message = "You do not have permission to report problems for this tool."
+        return render(request, "kiosk/error.html", {"message": message, "customer": customer})
+
     dictionary = {
         "tool": tool,
         "customer": customer,
@@ -638,17 +665,20 @@ def report_problem(request):
     if not settings.ALLOW_CONDITIONAL_URLS and form.cleaned_data["force_shutdown"]:
         site_title = ApplicationCustomization.get("site_title")
         dictionary["message"] = format_html(
-            '<ul class="errorlist"><li>{}</li></ul>'.format(
-                f"Tool control is only available on campus. When creating a task, you can't force a tool shutdown while using {site_title} off campus.",
-            )
+            '<ul class="errorlist"><li>{}</li></ul>',
+            f"Tool control is only available on campus. When creating a task, you can't force a tool shutdown while using {site_title} off campus.",
         )
         dictionary["form"] = form
         return render(request, "kiosk/tool_report_problem.html", dictionary)
 
     task = form.save()
     task.estimated_resolution_time = estimated_resolution_time
-    # Only staff can choose not to lock the tool
-    lock_interlock = not (customer.is_staff_on_tool(tool) and not form.cleaned_data["lock"])
+    # Only staff can choose not to lock the tool, and that's only possible if the option is enabled
+    lock_interlock = (
+        not RemoteWorkCustomization.get_bool("tool_interlock_ask_when_shutting_down_problem")
+        or not customer.is_staff_on_tool(task.tool)
+        or form.cleaned_data["lock"]
+    )
 
     save_task(request, task, customer, lock=lock_interlock)
 
@@ -679,6 +709,10 @@ def post_comment(request):
     tool = Tool.objects.get(id=request.POST["tool"])
     customer = User.objects.get(id=request.POST["customer_id"])
     back = request.POST["back"]
+
+    if ToolCustomization.get_bool("tool_comments_hide_for_non_staff") and not customer.is_any_part_of_staff:
+        message = "You do not have permission to post comments on this tool."
+        return render(request, "kiosk/error.html", {"message": message, "customer": customer})
 
     dictionary = {"back": back, "tool": tool, "customer": customer}
 
@@ -819,7 +853,7 @@ def add_withdraw_to_session(request, customer_id, withdrawal: ConsumableWithdraw
             "customer_id": withdrawal.customer_id,
             "consumable": str(withdrawal.consumable),
             "consumable_id": withdrawal.consumable_id,
-            "project": str(withdrawal.project),
+            "project": withdrawal.project.get_display(),
             "project_id": withdrawal.project_id,
             "quantity": withdrawal.quantity,
         }

@@ -26,11 +26,11 @@ class OutageTestCase(NEMOTestCaseMixin, TestCase):
         title="",
         start: datetime = None,
         end: datetime = None,
-        item_id: int = "",
+        item_id: str = "",
         item_type: ReservationItemType = ReservationItemType.TOOL,
         outage: bool = False,
         frequency: RecurrenceFrequency = None,
-        interval: int = "",
+        interval: str = "",
         until: datetime = None,
     ):
         if not start:
@@ -375,7 +375,7 @@ class OutageTestCase(NEMOTestCaseMixin, TestCase):
         self.every_day_for_a_week(item_id=area.id, item_type=ReservationItemType.AREA)
 
     def every_day_for_a_week(self, item_id: int, item_type: ReservationItemType):
-        start = datetime.now()
+        start = datetime.now().replace(microsecond=0)
         end = start + timedelta(hours=1)
         until = start + timedelta(days=6)
 
@@ -395,21 +395,29 @@ class OutageTestCase(NEMOTestCaseMixin, TestCase):
         response = self.client.post(reverse("create_outage"), data, follow=True)
 
         self.assertEqual(response.status_code, 200)
-        outages = ScheduledOutage.objects.filter(title="every day outage week", tool=tool)
+        if item_type == ReservationItemType.TOOL:
+            outages = ScheduledOutage.objects.filter(title="every day outage week", tool=tool)
+        else:
+            outages = ScheduledOutage.objects.filter(title="every day outage week", area=area)
         self.assertEqual(len(outages), 7)
-        duration = end - start
+        local_start = start.astimezone()
+        local_end = end.astimezone()
+        expected_local_duration = local_end - local_start
         for outage in outages:
-            # Make sure they all start at the same hour, end at the same hour and the duration is the same
-            self.assertEqual(outage.start.astimezone().hour, start.astimezone().hour)
-            self.assertEqual(outage.end.astimezone().hour, end.astimezone().hour)
-            self.assertEqual(duration, outage.end - outage.start)
+            # Make sure they all start at the same time and end at the same time (in local timezone)
+            local_outage_start = outage.start.astimezone()
+            local_outage_end = outage.end.astimezone()
+            local_outage_duration = local_outage_end - local_outage_start
+            self.assertEqual(local_outage_start.time(), local_start.time())
+            self.assertEqual(local_outage_end.time(), local_end.time())
+            self.assertEqual(local_outage_duration, expected_local_duration)
 
     def test_every_week_for_a_year(self):
         self.every_week_for_a_year(item_id=tool.id, item_type=ReservationItemType.TOOL)
         self.every_week_for_a_year(item_id=area.id, item_type=ReservationItemType.AREA)
 
     def every_week_for_a_year(self, item_id: int, item_type: ReservationItemType):
-        start = (datetime.now() + timedelta(days=1)).replace(microsecond=0).replace(hour=7)
+        start = (datetime.now() + timedelta(days=1)).replace(microsecond=0).replace(second=0).replace(hour=7)
         end = start + timedelta(hours=1)
         until = datetime.now() + timedelta(days=365)
 

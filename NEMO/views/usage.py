@@ -3,7 +3,7 @@ from logging import getLogger
 from typing import Callable, List, Set
 
 from django.conf import settings
-from django.contrib.auth.decorators import login_required
+from django.contrib.auth.decorators import login_required, user_passes_test
 from django.db.models import F, Q
 from django.http import HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, redirect, render
@@ -11,7 +11,7 @@ from django.urls import reverse
 from django.views.decorators.http import require_GET
 from requests import get
 
-from NEMO.decorators import accounting_or_user_office_or_manager_required, any_staff_required
+from NEMO.decorators import staff_member_or_tool_staff_required
 from NEMO.models import (
     Account,
     AccountType,
@@ -45,9 +45,23 @@ from NEMO.views.api_billing import (
     billable_items_training_sessions,
     billable_items_usage_events,
 )
-from NEMO.views.customization import AdjustmentRequestsCustomization, ProjectsAccountsCustomization, ToolCustomization
+from NEMO.views.customization import (
+    AdjustmentRequestsCustomization,
+    ProjectsAccountsCustomization,
+    ToolControlCustomization,
+)
 
 logger = getLogger(__name__)
+
+
+def project_billing_permissions(user):
+    return user.is_active and (
+        user.is_accounting_officer
+        or user.is_user_office
+        or user.is_facility_manager
+        or user.is_superuser
+        or user.has_perm("NEMO.use_project_billing")
+    )
 
 
 def get_project_applications():
@@ -108,16 +122,32 @@ def user_usage(request):
     trainee_filter = Q(trainee=user) | Q(project__in=user_managed_projects)
     show_only_my_usage = user_managed_projects and request.GET.get("show_only_my_usage", "enabled") == "enabled"
     csv_export = bool(request.GET.get("csv", False))
+    all_managed_users = request.GET.get("managed_user") == "all"
     managed_user_id = quiet_int(request.GET.get("managed_user"))
-    if managed_user_id and not managed_user_id in user.managed_users.values_list("id", flat=True):
+    if (
+        not all_managed_users
+        and managed_user_id
+        and not managed_user_id in user.managed_users.values_list("id", flat=True)
+    ):
         return HttpResponseBadRequest("You are not allowed to see this user's usage.")
-    if show_only_my_usage or managed_user_id:
-        # Forcing to be user only (either current user or the one selected)
-        forced_user_id = managed_user_id or user.id
-        customer_filter = Q(customer_id=forced_user_id)
-        user_filter = Q(user_id=forced_user_id)
-        trainee_filter = Q(trainee_id=forced_user_id)
-        show_only_my_usage = not managed_user_id
+    if show_only_my_usage or managed_user_id or all_managed_users:
+        if all_managed_users:
+            # forcing to be current user and managed users
+            customer_filter = Q(customer_id=user.id)
+            user_filter = Q(user_id=user.id)
+            trainee_filter = Q(trainee_id=user.id)
+            for managed_user_id in user.managed_users.values_list("id", flat=True):
+                customer_filter |= Q(customer_id=managed_user_id)
+                user_filter |= Q(user_id=managed_user_id)
+                trainee_filter |= Q(trainee_id=managed_user_id)
+                show_only_my_usage = False
+        else:
+            # Forcing to be user only (either current user or the one selected)
+            forced_user_id = managed_user_id or user.id
+            customer_filter = Q(customer_id=forced_user_id)
+            user_filter = Q(user_id=forced_user_id)
+            trainee_filter = Q(trainee_id=forced_user_id)
+            show_only_my_usage = not managed_user_id
     return usage(
         request,
         usage_filter=user_filter,
@@ -132,20 +162,40 @@ def user_usage(request):
     )
 
 
-@any_staff_required
+@staff_member_or_tool_staff_required
 @require_GET
 def staff_usage(request):
     csv_export = bool(request.GET.get("csv", False))
+    all_managed_users = request.GET.get("managed_user") == "all"
     managed_user_id = quiet_int(request.GET.get("managed_user"))
-    if managed_user_id and not managed_user_id in request.user.managed_users.values_list("id", flat=True):
+    if (
+        not all_managed_users
+        and managed_user_id
+        and not managed_user_id in request.user.managed_users.values_list("id", flat=True)
+    ):
         return HttpResponseBadRequest("You are not allowed to see this user's usage.")
-    user_id = managed_user_id or request.user.id
-    usage_filter = Q(operator_id=user_id) & ~Q(user=F("operator"))
-    area_access_filter = Q(staff_charge__staff_member_id=user_id)
-    staff_charges_filter = Q(staff_member_id=user_id)
-    consumable_filter = Q(merchant_id=user_id)
-    user_filter = Q(pk__in=[])
-    trainee_filter = Q(trainer_id=user_id)
+    if all_managed_users:
+        usage_filter = Q(operator_id=request.user.id) & ~Q(user=F("operator"))
+        area_access_filter = Q(staff_charge__staff_member_id=request.user.id)
+        staff_charges_filter = Q(staff_member_id=request.user.id)
+        consumable_filter = Q(merchant_id=request.user.id)
+        user_filter = Q(pk__in=[])
+        trainee_filter = Q(trainer_id=request.user.id)
+        for managed_user_id in request.user.managed_users.values_list("id", flat=True):
+            usage_filter |= Q(operator_id=managed_user_id) & ~Q(user=F("operator"))
+            area_access_filter |= Q(staff_charge__staff_member_id=managed_user_id)
+            staff_charges_filter |= Q(staff_member_id=managed_user_id)
+            consumable_filter |= Q(merchant_id=managed_user_id)
+            user_filter |= Q(pk__in=[])
+            trainee_filter |= Q(trainer_id=managed_user_id)
+    else:
+        user_id = managed_user_id or request.user.id
+        usage_filter = Q(operator_id=user_id) & ~Q(user=F("operator"))
+        area_access_filter = Q(staff_charge__staff_member_id=user_id)
+        staff_charges_filter = Q(staff_member_id=user_id)
+        consumable_filter = Q(merchant_id=user_id)
+        user_filter = Q(pk__in=[])
+        trainee_filter = Q(trainer_id=user_id)
     return usage(
         request,
         usage_filter=usage_filter,
@@ -176,11 +226,13 @@ def usage(
     base_dictionary, start_date, end_date, kind, identifier = date_parameters_dictionary(request, get_month_timeframe)
     # Preloading user's managed projects' and managed users`
     base_dictionary["user"] = (
-        User.objects.filter(id=user.id).prefetch_related("managed_projects", "managed_users").first()
+        User.objects.filter(id=user.id)
+        .prefetch_related("managed_projects", "managed_accounts__project_set", "managed_users")
+        .first()
     )
     selected_managed_user_id = request.GET.get("managed_user")
     base_dictionary["selected_managed_user"] = selected_managed_user_id
-    if selected_managed_user_id:
+    if selected_managed_user_id or not show_only_my_usage:
         base_dictionary["explicitly_display_customer"] = True
     project_id = request.GET.get("project") or request.GET.get("pi_project")
     if user_managed_projects:
@@ -269,12 +321,16 @@ def billing(request):
         return render(request, "usage/billing.html", base_dictionary)
 
 
-@accounting_or_user_office_or_manager_required
+@user_passes_test(project_billing_permissions)
 @require_GET
 def project_usage(request):
     base_dictionary, start_date, end_date, kind, identifier = date_parameters_dictionary(request, get_day_timeframe)
     # Preloading user's managed projects'
-    base_dictionary["user"] = User.objects.filter(id=request.user.id).prefetch_related("managed_projects").first()
+    base_dictionary["user"] = (
+        User.objects.filter(id=request.user.id)
+        .prefetch_related("managed_projects", "managed_accounts__project_set")
+        .first()
+    )
 
     area_access, consumables, missed_reservations, staff_charges, training_sessions, usage_events = (
         None,
@@ -395,7 +451,7 @@ def project_usage(request):
     return render(request, "usage/usage.html", {**base_dictionary, **dictionary})
 
 
-@accounting_or_user_office_or_manager_required
+@user_passes_test(project_billing_permissions)
 @require_GET
 def project_billing(request):
     base_dictionary, start_date, end_date, kind, identifier = date_parameters_dictionary(request, get_day_timeframe)
@@ -588,7 +644,7 @@ def csv_export_response(
         if billable_item.type == "staff_charge" and billable_item.item:
             row["note"] = billable_item.item.note
         if (
-            ToolCustomization.get_bool("tool_control_note_show")
+            ToolControlCustomization.get_bool("tool_control_note_show")
             and billable_item.type == "tool_usage"
             and billable_item.item
         ):
@@ -601,14 +657,12 @@ def csv_export_response(
 
 
 def get_managed_projects(user: User) -> Set[Project]:
-    # This function will get managed projects from NEMO and also attempt to get them from billing service
-    managed_projects = set(
-        list(
-            Project.objects.filter(
-                Q(id__in=user.managed_projects.values_list("id", flat=True))
-                | Q(account_id__in=user.managed_accounts.values_list("id", flat=True))
-            )
-        )
+    # This function will get managed projects from NEMO and also attempt to get them from the billing service
+    # We need to use the actual projects and accounts so we can prefetch them beforehand to speed up the process
+    managed_projects = set(user.managed_projects.all())
+    managed_accounts = set(user.managed_accounts.all())
+    managed_projects = managed_projects.union(
+        {project for account in managed_accounts for project in account.project_set.all()}
     )
     billing_service = get_billing_service()
     if billing_service.get("available", False):

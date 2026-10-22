@@ -50,6 +50,19 @@
             </select>
         </div>
     {% endif %}
+    {% if customizations|get_item:"tool_problem_title_enabled" == "enabled" %}
+        <div class="form-group">
+            <label for="title">
+                Optionally, give the problem a short title. If provided, this is what will be shown in lists instead of the full description below.
+            </label>
+            <input id="title"
+                   name="title"
+                   type="text"
+                   class="form-control"
+                   maxlength="1024"
+                   value="{{ form.title.value|default_if_none:'' }}">
+        </div>
+    {% endif %}
     <div class="form-group">
         <label for="description">
             Please provide a <strong>detailed</strong> description of the problem so that the {{ facility_name }} staff have enough information to resolve the problem efficiently.
@@ -90,7 +103,7 @@
                 <span style="padding-left:10px;">This problem represents a safety hazard to the {{ facility_name }} and should be regarded as urgent.Notify the {{ facility_name }} safety officer of this issue.</span>
             </label>
         </div>
-        {% if tool.problem_shutdown_enabled %}
+        {% if tool.problem_shutdown_enabled or customer|is_staff_on_tool:tool %}
             <div class="checkbox">
                 <label>
                     <input name="force_shutdown"
@@ -100,7 +113,7 @@
                     <span style="padding-left:10px;">Shut down the tool so that it may not be used until this problem is resolved.</span>
                 </label>
             </div>
-            {% if customer|is_staff_on_tool:tool and tool.interlock %}
+            {% if customer|is_staff_on_tool:tool and tool.interlock and customizations|get_item:"tool_interlock_ask_when_shutting_down_problem" == "enabled" %}
                 <div class="checkbox" id="tool_problem_lock">
                     <label>
                         <input name="lock" type="checkbox" {% if form.lock.value %}checked{% endif %} />
@@ -117,6 +130,7 @@
 <script>
     if (virtual_inputs)
     {
+	    $('#title').keyboard();
 	    $('#description').keyboard();
     }
 	{% if task_categories %}
@@ -139,5 +153,5 @@
   	shutdown_jq.on("change", toggle_lock_field);
   	toggle_lock_field();
 
-	revert(90);
+	revert_on_input(60, "#tool_report_problem");
 </script>

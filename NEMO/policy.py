@@ -1,6 +1,7 @@
 from abc import ABC
 from collections import defaultdict
 from datetime import datetime, time, timedelta
+from logging import getLogger
 from typing import Any, Callable, Iterable, List, Optional, Tuple, Union
 
 from django.conf import settings
@@ -8,6 +9,7 @@ from django.db.models import Q
 from django.http import HttpResponse, HttpResponseBadRequest
 from django.utils import timezone
 
+from NEMO.constants import EXTRA_POLICIES_SETTING, MAIN_POLICY_SETTING
 from NEMO.exceptions import (
     InactiveUserError,
     ItemNotAllowedForProjectException,
@@ -20,7 +22,9 @@ from NEMO.exceptions import (
     ProjectChargeException,
     ReservationRequiredUserError,
     ScheduledOutageInProgressError,
+    TrainingRequiredUserError,
     UnavailableResourcesUserError,
+    UserAccessError,
 )
 from NEMO.models import (
     Area,
@@ -56,6 +60,8 @@ from NEMO.views.customization import (
     ToolCustomization,
     get_media_file_contents,
 )
+
+policy_logger = getLogger(__name__)
 
 
 class BaseNEMOPolicy(ABC):
@@ -118,7 +124,7 @@ class BaseNEMOPolicy(ABC):
         """
         return HttpResponse()
 
-    def check_to_create_outage(self, outage: ScheduledOutage) -> HttpResponse:
+    def check_to_create_outage(self, user: User, outage: ScheduledOutage) -> HttpResponse:
         """
         Checks the outage creation policy.
         If all checks pass, the function should return an HTTP "OK" response.
@@ -144,14 +150,30 @@ class BaseNEMOPolicy(ABC):
         self,
         project: Project,
         user: User,
-        item: Union[Tool, Area, Consumable, StaffCharge] = None,
-        charge: Union[UsageEvent, AreaAccessRecord, ConsumableWithdraw, StaffCharge, Reservation] = None,
+        item: Tool | Area | Consumable | StaffCharge | None = None,
+        charge: UsageEvent | AreaAccessRecord | ConsumableWithdraw | StaffCharge | Reservation | None = None,
     ):
         """
         Checks the billing policy for a project and a charge.
         If there are any issues, the method should throw an Exception
         """
         pass
+
+    def check_qualifying_user_on_tools(self, user, tools: list[Tool]) -> list[str]:
+        """
+        Checks the policy for qualifying a user on tools.
+        If there are any issues, the method should return a list of error strings.
+        """
+        return []
+
+    def check_adding_physical_access_levels_to_user(
+        self, user, physical_access_levels: list[PhysicalAccessLevel]
+    ) -> list[str]:
+        """
+        Checks the policy for adding physical access levels to a user.
+        If there are any issues, the method should return a list of error strings.
+        """
+        return []
 
 
 class DefaultNEMOPolicy(BaseNEMOPolicy):
@@ -161,6 +183,12 @@ class DefaultNEMOPolicy(BaseNEMOPolicy):
         """
         Check that the user is allowed to enable the tool. Enable the tool if the policy checks pass.
         """
+        if user.has_negative_perm("NEMO.block_enable_tools"):
+            if user == operator:
+                return HttpResponseBadRequest("You do not have permission to enable tools.")
+            else:
+                return HttpResponseBadRequest(f"{user} does not have permission to enable tools.")
+
         facility_name = ApplicationCustomization.get("facility_name")
         site_title = ApplicationCustomization.get("site_title")
 
@@ -189,7 +217,7 @@ class DefaultNEMOPolicy(BaseNEMOPolicy):
             return HttpResponseBadRequest("You must be a staff member to use a tool on another user's behalf.")
 
         # All required resources must be available to operate a tool except for staff or service personnel.
-        unavailable_rss = tool.required_resource_set.filter(available=False).exists()
+        unavailable_rss = tool.required_resources.filter(available=False).exists()
         if unavailable_rss and not operator.is_staff_on_tool(tool) and not operator.is_service_personnel:
             return HttpResponseBadRequest("A resource that is required to operate this tool is unavailable.")
 
@@ -260,7 +288,7 @@ class DefaultNEMOPolicy(BaseNEMOPolicy):
         # Staff may only charge staff time for one user at a time.
         if staff_charge and operator.charging_staff_time():
             return HttpResponseBadRequest(
-                "You are already charging staff time. You must end the current staff charge before you being another."
+                "You are already charging staff time. You must end the current staff charge before you begin another."
             )
 
         # Staff may not bill staff time to themselves.
@@ -345,6 +373,12 @@ class DefaultNEMOPolicy(BaseNEMOPolicy):
         Check the reservation creation policy and return a list of policy problems if any.
         """
         user = new_reservation.user
+
+        if user.has_negative_perm("NEMO.block_create_reservations"):
+            if user == user_creating_reservation:
+                return ["You do not have permission to create reservations."], True
+            else:
+                return [str(user) + " does not have permission to create reservations."], True
 
         facility_name = ApplicationCustomization.get("facility_name")
         site_title = ApplicationCustomization.get("site_title")
@@ -819,13 +853,13 @@ class DefaultNEMOPolicy(BaseNEMOPolicy):
             if item.policy_off_between_times:
                 if item.policy_off_start_time < item.policy_off_end_time:
                     reservations_for_that_day = reservations_for_that_day.exclude(
-                        start__gte=datetime.combine(start_of_day.date(), item.policy_off_start_time),
-                        end__lte=datetime.combine(start_of_day.date(), item.policy_off_end_time),
+                        start__gte=datetime.combine(start_of_day.date(), item.policy_off_start_time).astimezone(),
+                        end__lte=datetime.combine(start_of_day.date(), item.policy_off_end_time).astimezone(),
                     )
                 else:
                     reservations_for_that_day = reservations_for_that_day.exclude(
-                        start__gte=datetime.combine(start_of_day.date(), item.policy_off_start_time),
-                        end__lte=datetime.combine(end_of_day.date(), item.policy_off_end_time),
+                        start__gte=datetime.combine(start_of_day.date(), item.policy_off_start_time).astimezone(),
+                        end__lte=datetime.combine(end_of_day.date(), item.policy_off_end_time).astimezone(),
                     )
             reservations_for_that_day = reservations_for_that_day.filter(**new_reservation.reservation_item_filter)
             # Exclude any reservation that is being cancelled.
@@ -1055,7 +1089,10 @@ class DefaultNEMOPolicy(BaseNEMOPolicy):
 
         return HttpResponse()
 
-    def check_to_create_outage(self, outage: ScheduledOutage) -> HttpResponse:
+    def check_to_create_outage(self, user: User, outage: ScheduledOutage) -> HttpResponse:
+        if user.has_negative_perm("NEMO.block_create_outages"):
+            return HttpResponseBadRequest("You do not have permission to create outages.")
+
         # Outages may not have a start time that is earlier than the end time.
         if outage.start >= outage.end:
             return HttpResponseBadRequest(
@@ -1087,8 +1124,14 @@ class DefaultNEMOPolicy(BaseNEMOPolicy):
         """
         Checks the area access policy for a user.
         """
+        if user.has_negative_perm("NEMO.block_enter_any_areas"):
+            raise UserAccessError(user=user, msg="You do not have permission to enter any areas.")
+
         if not user.is_active:
             raise InactiveUserError(user=user)
+
+        if user.training_required:
+            raise TrainingRequiredUserError(user=user)
 
         if user.active_project_count() < 1:
             raise NoActiveProjectsForUserError(user=user)
@@ -1103,6 +1146,9 @@ class DefaultNEMOPolicy(BaseNEMOPolicy):
     def check_to_enter_area(self, area: Area, user: User):
         # If explicitly set on the Physical Access Level, staff & user office
         # are exempt from being granted explicit access
+        if user.has_negative_perm("NEMO.block_enter_any_areas"):
+            raise UserAccessError(user=user, msg="You do not have permission to enter any areas.")
+
         if (user.is_staff or user.is_user_office) and any(
             [
                 access_level.accessible()
@@ -1146,10 +1192,15 @@ class DefaultNEMOPolicy(BaseNEMOPolicy):
         self,
         project: Project,
         user: User,
-        item: Union[Tool, Area, Consumable, StaffCharge] = None,
-        charge: Union[UsageEvent, AreaAccessRecord, ConsumableWithdraw, StaffCharge, Reservation] = None,
+        item: Tool | Area | Consumable | StaffCharge | None = None,
+        charge: UsageEvent | AreaAccessRecord | ConsumableWithdraw | StaffCharge | Reservation | None = None,
     ):
         if project:
+            if user.has_negative_perm("NEMO.block_bill_projects"):
+                raise NotAllowedToChargeProjectException(
+                    project=project, user=user, msg="You do not have permission to bill any projects"
+                )
+
             # Don't validate active projects for tool question consumables, it is done by the usage validation
             consumable_within_usage = (
                 isinstance(item, Consumable) and isinstance(charge, ConsumableWithdraw) and charge.tool_usage
@@ -1162,26 +1213,38 @@ class DefaultNEMOPolicy(BaseNEMOPolicy):
                 allowed_tools = project.only_allow_tools.all()
                 if allowed_tools.exists():
                     if isinstance(item, Tool) and item not in allowed_tools:
-                        msg = f"{item.name} is not allowed for project {project.name}"
+                        msg = f"{item.name} is not allowed for project {project.get_display()}"
                         raise ItemNotAllowedForProjectException(project, user, item.name, msg)
                     elif isinstance(item, Area) and item.id not in distinct_qs_value_list(
                         allowed_tools, "_requires_area_access_id"
                     ):
-                        msg = f"{item.name} is not allowed for project {project.name}"
+                        msg = f"{item.name} is not allowed for project {project.get_display()}"
                         raise ItemNotAllowedForProjectException(project, user, item.name, msg)
                 # Check if consumable withdrawals are allowed
                 # But only when doing a direct withdrawal, we cannot prevent tool usage consumable withdrawals
                 if isinstance(item, Consumable) and isinstance(charge, ConsumableWithdraw):
                     if not charge.tool_usage and not project.allow_consumable_withdrawals:
-                        msg = f"Consumable withdrawals are not allowed for project {project.name}"
+                        msg = f"Consumable withdrawals are not allowed for project {project.get_display()}"
                         raise ItemNotAllowedForProjectException(project, user, "Consumable withdrawals", msg)
                 # Check if staff charges are allowed
                 if isinstance(item, StaffCharge) and not project.allow_staff_charges:
-                    msg = f"Staff charges are not allowed for project {project.name}"
+                    msg = f"Staff charges are not allowed for project {project.get_display()}"
                     raise ItemNotAllowedForProjectException(project, user, "Staff Charges", msg)
 
+    def check_qualifying_user_on_tools(self, user, tools: list[Tool]) -> list[str]:
+        if user.has_negative_perm("NEMO.block_qualify_on_tools"):
+            return [f"{user} is not allowed to be qualified on any tools."]
+        return []
 
-def check_maximum_users_in_overlapping_reservations(reservations: List[Reservation]) -> Tuple[int, datetime]:
+    def check_adding_physical_access_levels_to_user(
+        self, user, physical_access_levels: list[PhysicalAccessLevel]
+    ) -> list[str]:
+        if user.has_negative_perm("NEMO.block_add_physical_access_levels"):
+            return [f"{user} is not allowed to have any physical access levels."]
+        return []
+
+
+def check_maximum_users_in_overlapping_reservations(reservations: List[Reservation]) -> Tuple[int, datetime | None]:
     """
     Returns the maximum number of overlapping reservations and the earlier time the maximum is reached
     This will only count reservations made by different users. i.e. if a user has 3 reservations at the same
@@ -1207,9 +1270,9 @@ def check_maximum_users_in_overlapping_reservations(reservations: List[Reservati
 
     count = 0
     max_count = 0
-    max_time: Optional[datetime] = None
-    for time in times:
-        if time[1] == "start":
+    max_time: datetime | None = None
+    for t in times:
+        if t[1] == "start":
             count += 1  # increment on arrival/start
         else:
             count -= 1  # decrement on departure/end
@@ -1218,7 +1281,7 @@ def check_maximum_users_in_overlapping_reservations(reservations: List[Reservati
         max_count = max(count, max_count)
         # maintain earlier time max is reached
         if max_count > prev_count:
-            max_time = time[0]
+            max_time = t[0]
     return max_count, max_time
 
 
@@ -1283,6 +1346,14 @@ class NEMOPolicyChain:
                         combined_overridable = combined_overridable and bool(overridable)
                 return all_problems, combined_overridable
 
+            # Case 4: list aggregator (error string list pattern)
+            if results and isinstance(results[-1], list):
+                all_errors: List[str] = []
+                for r in results:
+                    if isinstance(r, list):
+                        all_errors.extend(r)
+                return all_errors
+
             # Default: return the last policy's result
             return results[-1]
 
@@ -1291,33 +1362,58 @@ class NEMOPolicyChain:
 
 def get_policy_classes() -> List[BaseNEMOPolicy]:
     """
-    Returns policy class instances in order.
+    Returns unique policy class instances in order.
+    Checks MAIN_POLICY_CLASS/EXTRA_POLICY_CLASSES first,
+    falls back to POLICY_CLASS/POLICY_CLASSES for backward compatibility.
     """
-    policies = []
+    default_policy_path = f"{DefaultNEMOPolicy.__module__}.{DefaultNEMOPolicy.__qualname__}"
 
-    # If the legacy single-policy setting exists, always put it first
-    if hasattr(settings, "NEMO_POLICY_CLASS"):
-        legacy = get_class_from_settings("NEMO_POLICY_CLASS", None)
-        if legacy:
-            policies.append(legacy)
-
-    # Then append the configured list
-    if hasattr(settings, "NEMO_POLICY_CLASSES"):
-        policies.extend(get_classes_from_settings("NEMO_POLICY_CLASSES", ["NEMO.policy.DefaultNEMOPolicy"]))
+    # ---------------------------------------------------------
+    # 1. Resolve Main Policy (Prioritize New -> Old -> Default)
+    # ---------------------------------------------------------
+    if hasattr(settings, MAIN_POLICY_SETTING):
+        # New setting found
+        main_policy = get_class_from_settings(MAIN_POLICY_SETTING, default_policy_path)
+    elif hasattr(settings, "NEMO_POLICY_CLASS"):
+        # Fallback to the old setting
+        policy_logger.warning(
+            f"NEMO_POLICY_CLASS is deprecated. Please rename it to {MAIN_POLICY_SETTING} in settings.py",
+        )
+        main_policy = get_class_from_settings("NEMO_POLICY_CLASS", default_policy_path)
     else:
-        policies.extend(get_classes_from_settings("NEMO_POLICY_CLASSES", ["NEMO.policy.DefaultNEMOPolicy"]))
+        # Neither exists, use default
+        # (We call the getter on the new name, knowing it defaults to 'default_policy_path')
+        main_policy = get_class_from_settings(MAIN_POLICY_SETTING, default_policy_path)
 
-    # De-duplicate by instance type, preserving order
-    unique_classes = []
+    # ---------------------------------------------------------
+    # 2. Resolve Extra Policies (Prioritize New -> Old -> Empty)
+    # ---------------------------------------------------------
+    if hasattr(settings, EXTRA_POLICIES_SETTING):
+        extra_policies = get_classes_from_settings(EXTRA_POLICIES_SETTING, [])
+    elif hasattr(settings, "NEMO_POLICY_CLASSES"):
+        policy_logger.warning(
+            f"NEMO_POLICY_CLASSES is deprecated. Please rename it to {EXTRA_POLICIES_SETTING} in settings.py",
+        )
+        extra_policies = get_classes_from_settings("NEMO_POLICY_CLASSES", [])
+    else:
+        extra_policies = []
+
+    # ---------------------------------------------------------
+    # 3. Combine & Deduplicate
+    # ---------------------------------------------------------
+    # Construct list (handling explicitly set None for main_policy)
+    all_policies = ([main_policy] if main_policy else []) + extra_policies
+
+    # 4. Deduplicate by type, preserving order
+    unique_policies = []
     seen_types = set()
-    for policy in policies:
-        t = type(policy)
-        if t in seen_types:
-            continue
-        seen_types.add(t)
-        unique_classes.append(policy)
 
-    return unique_classes
+    for policy in all_policies:
+        if type(policy) not in seen_types:
+            seen_types.add(type(policy))
+            unique_policies.append(policy)
+
+    return unique_policies
 
 
 NEMOPolicy = DefaultNEMOPolicy

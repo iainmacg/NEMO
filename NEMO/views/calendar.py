@@ -57,8 +57,13 @@ from NEMO.views.customization import (
     ToolCustomization,
     get_media_file_contents,
 )
+from NEMO.views.usage import get_managed_projects
 
 calendar_logger = getLogger(__name__)
+
+
+def _is_on_slot_boundary(dt: datetime, resolution_minutes: int) -> bool:
+    return dt.time().minute % resolution_minutes == 0
 
 
 @login_required
@@ -98,6 +103,8 @@ def calendar(request, item_type=None, item_id=None):
     calendar_all_tools = CalendarCustomization.get("calendar_all_tools")
     calendar_all_areas = CalendarCustomization.get("calendar_all_areas")
     calendar_all_areastools = CalendarCustomization.get("calendar_all_areastools")
+    calendar_slot_duration = CalendarCustomization.get_slot_duration()
+    calendar_slot_label_interval = CalendarCustomization.get_slot_label_interval()
 
     # Create reservation confirmation setting
     create_reservation_confirmation_default = CalendarCustomization.get_bool("create_reservation_confirmation")
@@ -133,6 +140,8 @@ def calendar(request, item_type=None, item_id=None):
         "calendar_all_tools": calendar_all_tools,
         "calendar_all_areas": calendar_all_areas,
         "calendar_all_areastools": calendar_all_areastools,
+        "calendar_slot_duration": calendar_slot_duration,
+        "calendar_slot_label_interval": calendar_slot_label_interval,
         "calendar_user_tool_lists": UserCalendarToolList.objects.filter(user=user),
         "create_reservation_confirmation": create_reservation_confirmation,
         "change_reservation_confirmation": change_reservation_confirmation,
@@ -140,6 +149,9 @@ def calendar(request, item_type=None, item_id=None):
         "reservation_confirmation_time_format": reservation_confirmation_time_format,
         "self_login": False,
         "self_logout": False,
+        "team_schedule": user.managed_projects.exists()
+        or user.managed_accounts.exists()
+        or (CalendarCustomization.get_bool("calendar_team_schedule_project_members") and user.projects.exists()),
     }
     login_logout = ApplicationCustomization.get_bool("calendar_login_logout", raise_exception=False)
     self_login = ApplicationCustomization.get_bool("self_log_in", raise_exception=False)
@@ -262,6 +274,14 @@ def reservation_event_feed(request, start, end):
     if personal_schedule:
         events = events.filter(user=request.user)
 
+    # Filter events that only have to do with the projects the current user manages (or is a member of).
+    team_schedule = request.GET.get("team_schedule")
+    if team_schedule:
+        team_projects = get_managed_projects(request.user)
+        if CalendarCustomization.get_bool("calendar_team_schedule_project_members"):
+            team_projects = team_projects.union(request.user.projects.all())
+        events = events.filter(project__in=team_projects)
+
     dictionary = {
         "events": events,
         "outages": outages,
@@ -269,7 +289,7 @@ def reservation_event_feed(request, start, end):
         "all_tools": all_tools,
         "all_areas": all_areas,
         "all_areastools": all_areastools,
-        "display_name": display_name,
+        "display_name": display_name or team_schedule,
         "display_configuration": CalendarCustomization.get_bool("calendar_configuration_in_reservations"),
     }
     return render(request, "calendar/reservation_event_feed.html", dictionary)
@@ -284,6 +304,7 @@ def usage_event_feed(request, start, end):
     item_type = ReservationItemType(request.GET.get("item_type")) if request.GET.get("item_type") else None
 
     personal_schedule = request.GET.get("personal_schedule")
+    team_schedule = request.GET.get("team_schedule")
     all_areas = request.GET.get("all_areas")
     all_tools = request.GET.get("all_tools")
     all_areastools = request.GET.get("all_areastools")
@@ -294,6 +315,12 @@ def usage_event_feed(request, start, end):
         usage_events = UsageEvent.objects.filter(user=request.user)
         area_access_events = AreaAccessRecord.objects.filter(customer=request.user)
         missed_reservations = Reservation.objects.filter(missed=True, user=request.user)
+    elif team_schedule:
+        # Filter events that only have to do with the projects the current user manages.
+        managed_projects = get_managed_projects(request.user)
+        usage_events = UsageEvent.objects.filter(project__in=managed_projects)
+        area_access_events = AreaAccessRecord.objects.filter(project__in=managed_projects)
+        missed_reservations = Reservation.objects.filter(missed=True, project__in=managed_projects)
     elif all_areas:
         area_access_events = AreaAccessRecord.objects.filter()
         missed_reservations = Reservation.objects.filter(missed=True, tool=None)
@@ -389,7 +416,6 @@ def configuration_agenda_event_feed(request, start, end):
         if item_id and not all_tools:
             events = events.filter(**{f"{item_type.value}__id": item_id})
 
-    # TODO: Filter events that only have to do with the current user's primary, backup and superuser tools.
     personal_schedule = request.GET.get("personal_schedule")
 
     dictionary = {
@@ -482,6 +508,7 @@ def create_item_reservation(request, current_user: User, start, end, item_type: 
                     {
                         "active_projects": active_projects,
                         "missed_reservation_threshold": new_reservation.reservation_item.missed_reservation_threshold,
+                        "late_cancellation_reservation_threshold": new_reservation.reservation_item.late_cancellation_reservation_threshold,
                     },
                 )
 
@@ -746,6 +773,10 @@ def modify_reservation(request, current_user, start_delta, end_delta):
     reservation_to_cancel.cancellation_time = now
     reservation_to_cancel.cancelled_by = current_user
 
+    if reservation_to_cancel.start < new_reservation.start:
+        # Only check if it has a different time that is later. If moved earlier, it's fine
+        check_for_late_cancellation(current_user, reservation_to_cancel)
+
     policy_problems, overridable = policy.check_to_save_reservation(
         cancelled_reservation=reservation_to_cancel,
         new_reservation=new_reservation,
@@ -783,7 +814,7 @@ def modify_outage(request, start_delta, end_delta):
         outage.start += start_delta
     if end_delta:
         outage.end += end_delta
-    response = policy.check_to_create_outage(outage)
+    response = policy.check_to_create_outage(request.user, outage)
     if response.status_code != HTTPStatus.OK:
         return response
     else:
@@ -828,12 +859,11 @@ def cancel_outage(request, outage_id):
         return render(request, "mobile/cancellation_result.html", dictionary)
 
 
-@staff_member_or_tool_staff_required
 @require_POST
 def set_reservation_title(request, reservation_id):
     """Change reservation title for a user."""
     reservation = get_object_or_404(Reservation, id=reservation_id)
-    if not request.user.is_staff_on_tool(reservation.tool):
+    if not (request.user.is_staff_on_tool(reservation.tool) or request.user == reservation.user):
         return HttpResponseBadRequest("You are not allowed to edit this reservation.")
     reservation.title = request.POST.get("title", "")[: reservation._meta.get_field("title").max_length]
     reservation.save_and_notify()
@@ -883,12 +913,13 @@ def change_reservation_date(request):
     """Change a reservation's start or end date for a user."""
     reservation = get_object_or_404(Reservation, id=request.POST["id"])
     start_delta, end_delta = None, None
+    resolution_minutes = CalendarCustomization.get_slot_resolution_minutes()
     new_start = request.POST.get("new_start", None)
     if new_start:
         try:
             new_start = make_aware(datetime.strptime(new_start, datetime_input_format))
-            if new_start.time().minute not in [0, 15, 30, 45]:
-                return HttpResponseBadRequest("Reservation time only works with 15 min increments")
+            if not _is_on_slot_boundary(new_start, resolution_minutes):
+                return HttpResponseBadRequest(f"Reservation time only works with {resolution_minutes} min increments")
         except ValueError:
             return HttpResponseBadRequest("Invalid date format for start date")
         start_delta = new_start - reservation.start
@@ -896,8 +927,8 @@ def change_reservation_date(request):
     if new_end:
         try:
             new_end = make_aware(datetime.strptime(new_end, datetime_input_format))
-            if new_end.time().minute not in [0, 15, 30, 45]:
-                return HttpResponseBadRequest("Reservation time only works with 15 min increments")
+            if not _is_on_slot_boundary(new_end, resolution_minutes):
+                return HttpResponseBadRequest(f"Reservation time only works with {resolution_minutes} min increments")
         except ValueError:
             return HttpResponseBadRequest("Invalid date format for end date")
         end_delta = (new_end - reservation.end) if new_end else None
@@ -915,12 +946,13 @@ def change_outage_date(request):
     if not request.user.is_staff and not request.user.is_staff_on_tool(outage.tool):
         return HttpResponseBadRequest("You are not allowed to edit this outage.")
     start_delta, end_delta = None, None
+    resolution_minutes = CalendarCustomization.get_slot_resolution_minutes()
     new_start = request.POST.get("new_start", None)
     if new_start:
         try:
             new_start = make_aware(datetime.strptime(new_start, datetime_input_format))
-            if new_start.time().minute not in [0, 15, 30, 45]:
-                return HttpResponseBadRequest("Outage time only works with 15 min increments")
+            if not _is_on_slot_boundary(new_start, resolution_minutes):
+                return HttpResponseBadRequest(f"Outage time only works with {resolution_minutes} min increments")
         except ValueError:
             return HttpResponseBadRequest("Invalid date format for start date")
         start_delta = new_start - outage.start
@@ -928,8 +960,8 @@ def change_outage_date(request):
     if new_end:
         try:
             new_end = make_aware(datetime.strptime(new_end, datetime_input_format))
-            if new_end.time().minute not in [0, 15, 30, 45]:
-                return HttpResponseBadRequest("Outage time only works with 15 min increments")
+            if not _is_on_slot_boundary(new_end, resolution_minutes):
+                return HttpResponseBadRequest(f"Outage time only works with {resolution_minutes} min increments")
         except ValueError:
             return HttpResponseBadRequest("Invalid date format for end date")
         end_delta = (new_end - outage.end) if new_end else None
@@ -969,7 +1001,7 @@ def change_reservation_project(request, reservation_id):
         if not reservation.has_not_started():
             return HttpResponseBadRequest("Project cannot be changed; reservation has already started")
         if project not in reservation.user.active_projects():
-            return HttpResponseForbidden(f"{project} is not one of {reservation.user}'s active projects")
+            return HttpResponseForbidden(f"{project.get_display()} is not one of {reservation.user}'s active projects")
     return HttpResponse()
 
 
@@ -992,14 +1024,23 @@ def get_selected_tool_calendar_info(request, tool_id):
     )
 
 
-def shorten_reservation(user: User, item: Union[Area, Tool], new_end: datetime = None, force=False):
+def shorten_reservation(
+    user: User, reservation_user: User, item: Union[Area, Tool], new_end: datetime = None, force=False
+):
     try:
         if new_end is None:
             new_end = timezone.now()
         current_reservation_qs = Reservation.objects.filter(
-            start__lt=timezone.now(), end__gt=timezone.now(), cancelled=False, missed=False, shortened=False, user=user
+            start__lt=timezone.now(),
+            end__gt=timezone.now(),
+            cancelled=False,
+            missed=False,
+            shortened=False,
+            user=reservation_user,
         )
-        current_reservation = current_reservation_qs.get(**{ReservationItemType.from_item(item).value: item})
+        reservation_item_type = ReservationItemType.from_item(item)
+        reservation_item_id = item.tool_or_parent_id() if reservation_item_type == ReservationItemType.TOOL else item.id
+        current_reservation = current_reservation_qs.get(**{reservation_item_type.value: reservation_item_id})
         # Staff are exempt from mandatory reservation shortening.
         if (user.is_staff is False and user.is_staff_on_tool(item) is False) or force:
             new_reservation = current_reservation.copy(new_end=new_end)
@@ -1034,6 +1075,8 @@ def cancel_the_reservation(
         reservation.cancellation_time = timezone.now()
         reservation.cancelled_by = user_cancelling_reservation
 
+        check_for_late_cancellation(user_cancelling_reservation, reservation)
+
         if reason:
             """don't notify (just save) in this case since we are sending a specific email for the cancellation"""
             reservation.save()
@@ -1053,8 +1096,15 @@ def cancel_the_reservation(
                     recipients.extend(reservation.area.reservation_email_list())
                 if reservation.user.get_preferences().attach_cancelled_reservation:
                     event_name = reservation.title or f"{reservation.reservation_item.name} Reservation"
+                    location = getattr(reservation.reservation_item, "location", None)
                     attachment = create_ics(
-                        reservation.id, event_name, reservation.start, reservation.end, reservation.user, cancelled=True
+                        reservation.id,
+                        event_name,
+                        reservation.start,
+                        reservation.end,
+                        reservation.user,
+                        cancelled=True,
+                        location=location,
                     )
                     send_mail(
                         subject="Your reservation was cancelled",
@@ -1078,6 +1128,22 @@ def cancel_the_reservation(
     return response
 
 
+# Mark the reservation as missed if it was canceled late by non-staff users
+def check_for_late_cancellation(user, reservation):
+    tool = reservation.tool
+    if tool and (
+        not tool.operational or tool.required_resource_is_unavailable() or tool.scheduled_outage_in_progress()
+    ):
+        # If the tool is down, do not mark as missed
+        return
+
+    late_cancellation_threshold = reservation.reservation_item.late_cancellation_reservation_threshold
+    if late_cancellation_threshold and not user.is_staff_on_tool(reservation.tool):
+        late_deletion = (reservation.start - timezone.now()).total_seconds() < late_cancellation_threshold * 60
+        if late_deletion:
+            reservation.missed = True
+
+
 def send_user_created_reservation_notification(reservation: Reservation):
     user = reservation.user
     recipients = (
@@ -1095,6 +1161,7 @@ def send_user_created_reservation_notification(reservation: Reservation):
         # We don't need to check for existence of reservation_created_user_email because we are attaching the ics reservation and sending the email regardless (message will be blank)
         if user_office_email:
             event_name = reservation.title or f"{reservation.reservation_item.name} Reservation"
+            location = getattr(reservation.reservation_item, "location", None)
             attachment = create_ics(
                 reservation.id,
                 event_name,
@@ -1102,6 +1169,7 @@ def send_user_created_reservation_notification(reservation: Reservation):
                 reservation.end,
                 reservation.user,
                 description=reservation.note,
+                location=location,
             )
             send_mail(
                 subject=subject, content=message, from_email=user_office_email, to=recipients, attachments=[attachment]
@@ -1129,8 +1197,15 @@ def send_user_cancelled_reservation_notification(reservation: Reservation):
         # We don't need to check for existence of reservation_cancelled_user_email because we are attaching the ics reservation and sending the email regardless (message will be blank)
         if user_office_email:
             event_name = reservation.title or f"{reservation.reservation_item.name} Reservation"
+            location = getattr(reservation.reservation_item, "location", None)
             attachment = create_ics(
-                reservation.id, event_name, reservation.start, reservation.end, reservation.user, cancelled=True
+                reservation.id,
+                event_name,
+                reservation.start,
+                reservation.end,
+                reservation.user,
+                cancelled=True,
+                location=location,
             )
             send_mail(
                 subject=subject, content=message, from_email=user_office_email, to=recipients, attachments=[attachment]
@@ -1209,7 +1284,8 @@ def send_tool_free_time_notification(
                 tool_freed_time_notifications__in=[tool],
                 tool_freed_time_notifications_min_time__lte=freed_time,
                 tool_freed_time_notifications_max_future_days__gte=days_in_the_future,
-            )
+                user__is_active=True,
+            ).exclude(user__access_expiration__lte=timezone.now())
             formatted_start = format_datetime(start_time)
             formatted_time = f"{freed_time:0.0f}"
             link = get_full_url(reverse("calendar"), request)

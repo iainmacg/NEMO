@@ -65,7 +65,7 @@ def json_search_base(items_to_search, display="__str__"):
     for item in items_to_search:
         attr = getattr(item, display, None)
         display_value = attr() if callable(attr) else attr
-        result += '{{"name":"{0}", "id":{1}}},'.format(escape(display_value), item.id)
+        result += '{{"name":"{0}", "id":"{1}"}},'.format(escape(display_value), item.id)
     result = result.rstrip(",") + "]"
     return mark_safe(result)
 
@@ -150,13 +150,17 @@ def get_item(dict_or_array, key):
 
 @register.simple_tag
 def project_selection_display(project):
-    project_selection_template = ProjectsAccountsCustomization.get("project_selection_template")
-    contents = "{{ project.name }}"
+    return render_template_string(ProjectsAccountsCustomization.get("project_selection_template"), "project", project)
+
+
+@register.simple_tag
+def render_template_string(template_string, obj_name, obj):
+    contents = str(obj) if obj else ""
     try:
-        contents = Template(project_selection_template).render(Context({"project": project}))
+        contents = Template(template_string).render(Context({obj_name: obj}))
     except:
         pass
-    return format_html(contents)
+    return mark_safe(contents)
 
 
 dist_version: str = "0"
@@ -333,7 +337,14 @@ def render_tool_properties(tool_properties):
     """
     Recursively renders a tool's properties, including nested dictionaries.
     The key format for nested values will be `parent key - child key`.
+    Schema-defined properties are displayed first, custom ones after.
     """
+    from NEMO.utilities import load_properties_schemas
+
+    schema_keys = list(load_properties_schemas("Tool").get("properties", {}).keys())
+    ordered_properties = {k: tool_properties[k] for k in schema_keys if k in tool_properties}
+    ordered_properties.update({k: v for k, v in tool_properties.items() if k not in schema_keys})
+
     html_output = ""
 
     def render_nested_properties(props, parent_key):
@@ -354,5 +365,5 @@ def render_tool_properties(tool_properties):
                     </div>
                     """
 
-    render_nested_properties(tool_properties, "")
+    render_nested_properties(ordered_properties, "")
     return mark_safe(html_output)

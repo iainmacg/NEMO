@@ -24,6 +24,7 @@ from NEMO.utilities import (
     EmailCategory,
     create_email_attachment,
     export_format_datetime,
+    get_tool_categories_for_filters,
     quiet_int,
     render_email_template,
     send_mail,
@@ -31,7 +32,7 @@ from NEMO.utilities import (
 )
 from NEMO.views.customization import (
     ApplicationCustomization,
-    ToolCustomization,
+    ToolControlCustomization,
     get_media_file_contents,
 )
 
@@ -102,6 +103,8 @@ def email_broadcast(request, audience=""):
     dictionary = {}
     if audience == "tool" or audience == "tool-reservation":
         dictionary["search_base"] = Tool.objects.filter(visible=True)
+    elif audience == "tool-categories":
+        dictionary["search_base"] = get_tool_categories_for_filters()
     elif audience == "area":
         dictionary["search_base"] = Area.objects.all()
     elif audience == "project" or audience == "project-pis":
@@ -206,7 +209,6 @@ def export_email_addresses(request):
         if not send_to_expired_access_users:
             users = [user for user in users if not user.has_access_expired()]
         for user in users:
-            user: User = user
             for email in user.get_emails(user.get_preferences().email_send_broadcast_emails):
                 writer.writerow(
                     [
@@ -347,6 +349,13 @@ def get_users_for_email(audience: str, selection: List, no_type: bool) -> (Query
         users = User.objects.filter(reservation_user__in=upcoming_reservations).distinct()
         if len(selection) == 1:
             topic = Tool.objects.filter(pk=selection[0]).first().name
+    elif audience == "tool-categories":
+        category_filter = Q()
+        for item in selection:
+            category_filter |= Q(qualifications___category=item) | (Q(qualifications___category__startswith=item + "/"))
+        users = User.objects.filter(category_filter).distinct()
+        if len(selection) == 1:
+            topic = selection[0]
     elif audience == "area":
         areas: QuerySetType[Area] = Area.objects.filter(pk__in=selection)
         access_levels = [access_level for area in areas for access_level in area.get_physical_access_levels()]
@@ -402,7 +411,9 @@ def get_users_for_email(audience: str, selection: List, no_type: bool) -> (Query
 
 def check_user_allowed(user: User, audience: str, selection: str) -> Optional[str]:
     if not user.is_any_part_of_staff:
-        allow_broadcast_upcoming_reservation = ToolCustomization.get("tool_control_broadcast_upcoming_reservation")
+        allow_broadcast_upcoming_reservation = ToolControlCustomization.get(
+            "tool_control_broadcast_upcoming_reservation"
+        )
         if not allow_broadcast_upcoming_reservation or audience != "tool-reservation":
             return "You may not broadcast email to this audience"
         else:

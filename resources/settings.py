@@ -52,6 +52,7 @@ SECURE_HSTS_INCLUDE_SUBDOMAINS = True
 # If True, the SecurityMiddleware redirects all non-HTTPS requests to HTTPS
 # (except for those URLs matching a regular expression listed in SECURE_REDIRECT_EXEMPT).
 SECURE_SSL_REDIRECT = False  # Set to True if you have an HTTPS Certificate installed
+SECURE_REDIRECT_EXEMPT = [r"^health/$"]
 # Set to "DENY" to prevent frames even from the same server
 X_FRAME_OPTIONS = "SAMEORIGIN"
 
@@ -237,6 +238,13 @@ EMAIL_BROADCAST_BCC_CHUNK_SIZE = None
 # Uncomment the following if using an email SMTP server
 # EMAIL_HOST = "mydomain.com"
 # EMAIL_PORT = 25
+
+# -------------------- SMTP Email override --------------------
+# Uncomment the following for testing with an SMTP server
+# The 'to' field will be overwritten with the EMAIL_OVERRIDE value, and 'cc' and 'bcc' fields removed.
+# EMAIL_OVERRIDE = ["override@mydomain.com"]
+# EMAIL_BACKEND = "NEMO.backends.OverrideSmtpEmailBackend"
+
 
 # -------------------- Email written to files --------------------
 # Uncomment the following for testing

@@ -12,10 +12,12 @@
             <td>Operator:</td>
             <td>{{ event.operator }}</td>
         </tr>
-        <tr>
-            <td>Project:</td>
-            <td>{{ event.project.name }}</td>
-        </tr>
+        {% if customizations|get_item:"project_hide_project_info" != "enabled" or user.is_any_part_of_staff or user == event.user %}
+            <tr>
+                <td>Project:</td>
+                <td>{{ event.project.get_display }}</td>
+            </tr>
+        {% endif %}
         <tr>
             <td>Tool:</td>
             <td>{{ event.tool }}</td>
@@ -43,6 +45,35 @@
                 <tr>
                     <td>Note:</td>
                     <td>{{ event.note|default_if_none:""|linebreaksbr }}</td>
+                </tr>
+            {% endif %}
+        {% endif %}
+        {% if user|is_staff_on_tool:event.tool or user == event.user or user == event.operator %}
+            {% if event.consumablewithdraw_set.exists %}
+                <tr>
+                    <td>Consumables:</td>
+                    <td style="padding: 0;">
+                        <table class="table" style="margin-bottom: 0;">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Quantity</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for consumablewithdraw in event.consumablewithdraw_set.all %}
+                                    <tr>
+                                        <td {% if consumablewithdraw.waived %}title="Waived" style="text-decoration: line-through"{% endif %}>
+                                            {{ consumablewithdraw.consumable.name }}
+                                        </td>
+                                        <td {% if consumablewithdraw.waived %}title="Waived" style="text-decoration: line-through"{% endif %}>
+                                            {{ consumablewithdraw.quantity }}
+                                        </td>
+                                    </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </td>
                 </tr>
             {% endif %}
         {% endif %}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import importlib
 import os
+import warnings
 from calendar import monthrange
 from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
@@ -31,7 +32,7 @@ from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.core.mail import EmailMessage
 from django.db import OperationalError, ProgrammingError
 from django.db.models import FileField, IntegerChoices, Model, QuerySet
-from django.http import HttpRequest, HttpResponse, QueryDict
+from django.http import Http404, HttpRequest, HttpResponse, QueryDict
 from django.shortcuts import resolve_url
 from django.template import Template
 from django.template.context import make_context
@@ -39,6 +40,7 @@ from django.urls import NoReverseMatch, resolve, reverse
 from django.utils import timezone as django_timezone
 from django.utils.formats import date_format, get_format, time_format
 from django.utils.html import format_html
+from django.utils.module_loading import import_string
 from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
 
@@ -333,7 +335,7 @@ class RecurrenceFrequency(Enum):
         return [(freq.index, freq.display_value) for freq in cls]
 
 
-def quiet_int(value_to_convert, default_upon_failure=0):
+def quiet_int(value_to_convert, default_upon_failure: int = 0) -> int:
     """
     Attempt to convert the given value to an integer. If there is any problem
     during the conversion, return 'default_upon_failure'.
@@ -435,8 +437,8 @@ def extract_times(
 
     try:
         new_start = float(start)
-        new_start = datetime.utcfromtimestamp(new_start)
-        new_start = localize(new_start)
+        new_start = datetime.fromtimestamp(new_start, timezone.utc).replace(tzinfo=None)
+        new_start = localize(new_start).replace(microsecond=0)
         if beginning_and_end:
             new_start = beginning_of_the_day(new_start)
     except:
@@ -445,8 +447,8 @@ def extract_times(
 
     try:
         new_end = float(end)
-        new_end = datetime.utcfromtimestamp(new_end)
-        new_end = localize(new_end)
+        new_end = datetime.fromtimestamp(new_end, timezone.utc).replace(tzinfo=None)
+        new_end = localize(new_end).replace(microsecond=0)
         if beginning_and_end:
             new_end = end_of_the_day(new_end)
     except:
@@ -762,6 +764,7 @@ def resize_image(image: InMemoryUploadedFile, max_size: int, quality=85) -> InMe
         width, height = img.size
         # no need to resize if width or height is already less than the max
         if width <= max_size or height <= max_size:
+            image.seek(0)
             return image
         if width > height:
             width_ratio = max_size / float(width)
@@ -908,12 +911,7 @@ def get_classes_from_settings(setting_name: str, default_value: Iterable) -> Lis
         setting_classes = [setting_classes]
     assert isinstance(setting_classes, Iterable)
     assert not isinstance(setting_classes, str)
-    classes = []
-    for setting_class in setting_classes:
-        pkg, attr = setting_class.rsplit(".", 1)
-        ret = getattr(importlib.import_module(pkg), attr)
-        classes.append(ret())
-    return classes
+    return [import_string(path)() for path in setting_classes]
 
 
 def create_ics(
@@ -925,6 +923,7 @@ def create_ics(
     organizer: User = None,
     cancelled: bool = False,
     description: str = None,
+    location: str = None,
 ) -> MIMEBase:
     from NEMO.views.customization import ApplicationCustomization
 
@@ -938,7 +937,7 @@ def create_ics(
     method_name = "CANCEL" if cancelled else "REQUEST"
     sequence = "SEQUENCE:2\n" if cancelled else "SEQUENCE:0\n"
     priority = "PRIORITY:5\n" if cancelled else "PRIORITY:0\n"
-    now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     start = start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     end = end.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [
@@ -952,6 +951,10 @@ def create_ics(
         f"DTSTAMP:{now}\n",
         f"DTSTART:{start}\n",
         f"DTEND:{end}\n",
+    ]
+    if location:
+        lines.append(f"LOCATION:{location}\n")
+    lines += [
         f'ATTENDEE;CN="{user.get_name()}";RSVP=TRUE:mailto:{user.email}\n',
         f'ORGANIZER;CN="{organizer}":mailto:{organizer_email}\n',
         f"SUMMARY:[{site_title}] {event_name}\n",
@@ -1194,8 +1197,10 @@ def safe_lazy_queryset_evaluation(qs: QuerySet, default=UNSET, raise_exception=F
     if default is UNSET:
         default = []
     try:
-        # force evaluation of queryset
-        _ = list(qs)
+        # force evaluation of queryset, ignore warnings (this is sort of the point)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            _ = list(qs)
         return qs, False
     except UndefinedTable if HAS_UNDEFINED_TABLE else OperationalError:
         if raise_exception:
@@ -1307,3 +1312,22 @@ def get_django_default_perm(model, action) -> str:
     """
     codename = get_permission_codename(action, model._meta)
     return f"{model._meta.app_label}.{codename}"
+
+
+def set_default_session_variable(
+    request, request_param_name: str, default_value="", session_variable_name=None, value=None
+) -> str:
+    session_variable_name = session_variable_name or request_param_name
+    if request.GET.get(request_param_name) is not None:
+        request.session[session_variable_name] = request.GET.get(request_param_name, default_value)
+    variable_value = default_value
+    if session_variable_name in request.session:
+        variable_value = request.session[session_variable_name]
+    return variable_value
+
+
+def get_object_or_404_from_queryset(queryset: QuerySetType[Any]) -> Optional[Any]:
+    instance = queryset.first()
+    if instance is None:
+        raise Http404("No %s matches the given query." % queryset.model._meta.object_name)
+    return instance

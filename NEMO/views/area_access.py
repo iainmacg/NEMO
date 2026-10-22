@@ -25,7 +25,9 @@ from NEMO.exceptions import (
     ProjectChargeException,
     ReservationRequiredUserError,
     ScheduledOutageInProgressError,
+    TrainingRequiredUserError,
     UnavailableResourcesUserError,
+    UserAccessError,
 )
 from NEMO.models import Area, AreaAccessRecord, Project, User
 from NEMO.policy import policy_class as policy
@@ -120,6 +122,9 @@ def new_area_access_record(request):
 
             dictionary["user_accessible_areas"], dictionary["areas"] = load_areas_for_use_in_template(customer)
             return render(request, "area_access/new_area_access_record_details.html", dictionary)
+        except UserAccessError as e:
+            dictionary["error_message"] = e.msg
+            return render(request, "area_access/new_area_access_record.html", dictionary)
         except:
             pass
         return render(request, "area_access/new_area_access_record.html", dictionary)
@@ -184,6 +189,9 @@ def new_area_access_record(request):
                 )
             )
             return render(request, "area_access/new_area_access_record.html", dictionary)
+        except UserAccessError as e:
+            dictionary["error_message"] = e.msg
+            return render(request, "area_access/new_area_access_record.html", dictionary)
         if record.customer.billing_to_project():
             dictionary["error_message"] = (
                 "{} is already billing area access to another area. The user must log out of that area before entering another.".format(
@@ -210,6 +218,8 @@ def check_policy_for_user(customer: User):
         policy.check_to_enter_any_area(user=customer)
     except InactiveUserError:
         error_message = "{} is inactive".format(customer)
+    except TrainingRequiredUserError:
+        error_message = "{} must complete their mandatory training before they can access any areas".format(customer)
     except NoActiveProjectsForUserError:
         error_message = "{} does not have any active projects to bill area access".format(customer)
     except NoPhysicalAccessUserError:
@@ -254,22 +264,45 @@ def change_project(request, new_project=None):
     except ProjectChargeException as e:
         dictionary = {"error": e.msg}
         return render(request, "area_access/change_project.html", dictionary)
-    # Stop billing the user's initial project
+
+    mode = ApplicationCustomization.get("area_access_change_project_charged")
+
+    if mode == "ask_user":
+        mode = (
+            "update_current_record"
+            if request.POST.get("area_change_project_charged") == "area_update_record"
+            else "create_new_record"
+        )
+
+    try:
+        if mode == "update_current_record":
+            update_current_record(user, new_project)
+        else:
+            create_new_record(user, new_project)
+    except ValidationError as e:
+        return render(request, "area_access/change_project.html", {"error": str(e)})
+
+    return redirect(reverse("landing"))
+
+
+def create_new_record(user, new_project):
     record = user.area_access_record()
     record.end = timezone.now()
     record.save()
     area = record.area
-    # Start billing the user's new project
-    record = AreaAccessRecord()
-    record.area = area
-    record.customer = request.user
+    new_record = AreaAccessRecord()
+    new_record.area = area
+    new_record.customer = user
+    new_record.project = new_project
+    new_record.full_clean()
+    new_record.save()
+
+
+def update_current_record(user, new_project):
+    record = user.area_access_record()
     record.project = new_project
-    try:
-        record.full_clean()
-    except ValidationError as e:
-        return render(request, "area_access/change_project.html", {"error": str(e)})
+    record.full_clean()
     record.save()
-    return redirect(reverse("landing"))
 
 
 @login_required
@@ -321,6 +354,10 @@ def self_log_in(request, load_areas=True):
             f"Your account has been deactivated. Please contact {facility_name} staff to resolve the problem."
         )
         return render(request, "area_access/self_login.html", dictionary)
+    except TrainingRequiredUserError:
+        dictionary["error_message"] = (
+            f"You must complete your mandatory training before you can enter any area. Please contact {facility_name} staff for more information."
+        )
     except NoActiveProjectsForUserError:
         dictionary["error_message"] = (
             f"You are not a member of any active projects. You won't be able to use any interlocked {facility_name} tools. Please contact {facility_name} staff for more information."
@@ -335,6 +372,9 @@ def self_log_in(request, load_areas=True):
         dictionary["error_message"] = (
             f"You have not been granted physical access to any {facility_name} area. Please visit the User Office if you believe this is an error."
         )
+        return render(request, "area_access/self_login.html", dictionary)
+    except UserAccessError as e:
+        dictionary["error_message"] = e.msg
         return render(request, "area_access/self_login.html", dictionary)
 
     if load_areas:
@@ -445,7 +485,7 @@ def log_out_user(user: User):
         record.end = timezone.now()
         record.save()
         # Shorten the user's area reservation since the user is now leaving
-        shorten_reservation(user, record.area)
+        shorten_reservation(record.customer, user, record.area)
         # Stop charging area access if staff is leaving the area
         staff_charge = user.get_staff_charge()
         if staff_charge:

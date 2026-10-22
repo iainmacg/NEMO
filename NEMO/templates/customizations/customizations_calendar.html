@@ -4,6 +4,46 @@
     <form method="POST" action="{% url 'customize' 'calendar' %}" class="form-horizontal">
         {% csrf_token %}
         <div class="form-group">
+            <label class="control-label col-md-3">Default event view</label>
+            <div class="col-md-9">
+                <div class="radio">
+                    <label>
+                        <input type="radio"
+                               id="calendar_default_event_view"
+                               name="calendar_default_event_view"
+                               {% if not calendar_default_event_view or calendar_default_event_view == 'reservations' %}checked{% endif %}
+                               value="reservations">
+                        Reservations
+                    </label>
+                    <label>
+                        <input type="radio"
+                               id="calendar_default_event_view"
+                               name="calendar_default_event_view"
+                               {% if calendar_default_event_view == 'usage' %}checked{% endif %}
+                               value="usage">
+                        {{ facility_name }} use
+                    </label>
+                    <br>
+                    <label>
+                        <input type="radio"
+                               id="calendar_default_event_view"
+                               name="calendar_default_event_view"
+                               {% if calendar_default_event_view == 'reservations_and_usage' %}checked{% endif %}
+                               value="reservations_and_usage">
+                        Reservations and use
+                    </label>
+                    <label>
+                        <input type="radio"
+                               id="calendar_default_event_view"
+                               name="calendar_default_event_view"
+                               {% if calendar_default_event_view == 'configuration_agenda' %}checked{% endif %}
+                               value="configuration_agenda">
+                        Configuration agenda
+                    </label>
+                </div>
+            </div>
+        </div>
+        <div class="form-group">
             <label class="control-label col-md-3">Default view</label>
             <div class="col-md-9">
                 <div class="radio">
@@ -68,6 +108,44 @@
                        placeholder="07:00:00">
             </div>
             <div class="col-md-6 help-block light-grey">The time the day starts in the calendar view (24h format).</div>
+        </div>
+        <div class="form-group">
+            <label class="control-label col-md-3" for="calendar_slot_resolution_minutes">Calendar resolution</label>
+            <div class="col-md-3">
+                <div class="input-group">
+                    {% with selected_resolution=calendar_slot_resolution_minutes|default:"15" %}
+                        <select id="calendar_slot_resolution_minutes" name="calendar_slot_resolution_minutes" class="form-control">
+                            <option value="5" {% if selected_resolution == "5" %}selected{% endif %}>5</option>
+                            <option value="10" {% if selected_resolution == "10" %}selected{% endif %}>10</option>
+                            <option value="15" {% if selected_resolution == "15" %}selected{% endif %}>15</option>
+                            <option value="20" {% if selected_resolution == "20" %}selected{% endif %}>20</option>
+                            <option value="30" {% if selected_resolution == "30" %}selected{% endif %}>30</option>
+                            <option value="60" {% if selected_resolution == "60" %}selected{% endif %}>60</option>
+                        </select>
+                    {% endwith %}
+                    <span class="input-group-addon">minutes</span>
+                </div>
+            </div>
+            <div class="col-md-6 help-block light-grey">Acts as global minimum reservation time.</div>
+        </div>
+        <div class="form-group">
+            <label class="control-label col-md-3" for="calendar_slot_label_interval_minutes">Time label interval</label>
+            <div class="col-md-3">
+                <div class="input-group">
+                    <input type="number"
+                           id="calendar_slot_label_interval_minutes"
+                           name="calendar_slot_label_interval_minutes"
+                           class="form-control"
+                           min="1"
+                           value="{{ calendar_slot_label_interval_minutes|default:60 }}">
+                    <span class="input-group-addon">minutes</span>
+                </div>
+            </div>
+            <div class="col-md-6 help-block light-grey">
+                Time label spacing is rounded to the nearest multiple of calendar resolution when saved.
+                <br>
+                Adjust axis time format if &lt; 60.
+            </div>
         </div>
         <div class="form-group">
             <label class="control-label col-md-3" for="calendar_outage_recurrence_limit">Outage recurrence limit</label>
@@ -145,11 +223,27 @@
                     </label>
                     <label style="padding-right: 20px;">
                         <input type="checkbox"
+                               id="calendar_team_schedule_project_members"
+                               name="calendar_team_schedule_project_members"
+                               {% if calendar_team_schedule_project_members %}checked{% endif %}
+                               value="enabled">
+                        Show team schedule (reservations) to all project members, not only PIs and account managers
+                    </label>
+                    <label style="padding-right: 20px;">
+                        <input type="checkbox"
                                id="calendar_qualified_tools"
                                name="calendar_qualified_tools"
                                {% if calendar_qualified_tools %}checked{% endif %}
                                value="enabled">
                         Show qualified tools button
+                    </label>
+                    <label style="padding-right: 20px;">
+                        <input type="checkbox"
+                               id="calendar_tool_category_filter"
+                               name="calendar_tool_category_filter"
+                               {% if calendar_tool_category_filter %}checked{% endif %}
+                               value="enabled">
+                        Show tool category filter (calendar and tool control)
                     </label>
                 </div>
             </div>
@@ -212,6 +306,128 @@
                            value="{{ calendar_status_bar_tool_max_width }}">
                     <span class="input-group-addon">px</span>
                 </div>
+            </div>
+        </div>
+        <div class="customization-separation" style="margin-bottom: 15px"></div>
+        <h3 class="customization-section-title">Calendar colors</h3>
+        <div class="form-group">
+            <div class="col-md-12">Default colors for calendar events</div>
+        </div>
+        <div class="form-group">
+            <label class="control-label col-md-3" for="calendar_color_tool_usage_default">Tool usage</label>
+            <div class="col-md-3">
+                <input type="color"
+                       id="calendar_color_tool_usage_default"
+                       name="calendar_color_tool_usage_default"
+                       class="form-control"
+                       value="{{ calendar_color_tool_usage_default }}">
+            </div>
+            <div class="col-md-6 help-block light-grey">
+                Default color for tool usage events, unless customized in <a href="{% url 'admin:NEMO_tool_changelist' %}">Detailed Administration -> Tools</a>.
+            </div>
+        </div>
+        <div class="form-group">
+            <label class="control-label col-md-3" for="calendar_color_area_access_default">Area access</label>
+            <div class="col-md-3">
+                <input type="color"
+                       id="calendar_color_area_access_default"
+                       name="calendar_color_area_access_default"
+                       class="form-control"
+                       value="{{ calendar_color_area_access_default }}">
+            </div>
+            <div class="col-md-6 help-block light-grey">
+                Default color for area access events, unless customized in <a href="{% url 'admin:NEMO_area_changelist' %}">Detailed Administration -> Areas</a>.
+            </div>
+        </div>
+        <div class="form-group">
+            <label class="control-label col-md-3" for="calendar_color_tool_reservation_default">Tool reservation</label>
+            <div class="col-md-3">
+                <input type="color"
+                       id="calendar_color_tool_reservation_default"
+                       name="calendar_color_tool_reservation_default"
+                       class="form-control"
+                       value="{{ calendar_color_tool_reservation_default }}">
+            </div>
+            <div class="col-md-6 help-block light-grey">
+                Default color for tool reservations, unless customized in <a href="{% url 'admin:NEMO_tool_changelist' %}">Detailed Administration -> Tools</a>.
+            </div>
+        </div>
+        <div class="form-group">
+            <label class="control-label col-md-3" for="calendar_color_area_reservation_default">Area reservation</label>
+            <div class="col-md-3">
+                <input type="color"
+                       id="calendar_color_area_reservation_default"
+                       name="calendar_color_area_reservation_default"
+                       class="form-control"
+                       value="{{ calendar_color_area_reservation_default }}">
+            </div>
+            <div class="col-md-6 help-block light-grey">
+                Default color for area reservations, unless customized in <a href="{% url 'admin:NEMO_area_changelist' %}">Detailed Administration -> Areas</a>.
+            </div>
+        </div>
+        <div class="form-group">
+            <label class="control-label col-md-3" for="calendar_color_tool_personal_schedule">Tool personal schedule</label>
+            <div class="col-md-3">
+                <input type="color"
+                       id="calendar_color_tool_personal_schedule"
+                       name="calendar_color_tool_personal_schedule"
+                       class="form-control"
+                       value="{{ calendar_color_tool_personal_schedule }}">
+            </div>
+            <div class="col-md-6 help-block light-grey">
+                Color for tool usage and reservations shown in a user's personal schedule (global, cannot be changed per tool).
+            </div>
+        </div>
+        <div class="form-group">
+            <label class="control-label col-md-3" for="calendar_color_area_personal_schedule">Area personal schedule</label>
+            <div class="col-md-3">
+                <input type="color"
+                       id="calendar_color_area_personal_schedule"
+                       name="calendar_color_area_personal_schedule"
+                       class="form-control"
+                       value="{{ calendar_color_area_personal_schedule }}">
+            </div>
+            <div class="col-md-6 help-block light-grey">
+                Color for area access and reservations shown in a user's personal schedule (global, cannot be changed per area).
+            </div>
+        </div>
+        <div class="form-group">
+            <label class="control-label col-md-3" for="calendar_color_tool_missed_reservation">Tool missed reservation</label>
+            <div class="col-md-3">
+                <input type="color"
+                       id="calendar_color_tool_missed_reservation"
+                       name="calendar_color_tool_missed_reservation"
+                       class="form-control"
+                       value="{{ calendar_color_tool_missed_reservation }}">
+            </div>
+            <div class="col-md-6 help-block light-grey">
+                Color for missed tool reservations (global, cannot be changed per tool).
+            </div>
+        </div>
+        <div class="form-group">
+            <label class="control-label col-md-3" for="calendar_color_area_missed_reservation">Area missed reservation</label>
+            <div class="col-md-3">
+                <input type="color"
+                       id="calendar_color_area_missed_reservation"
+                       name="calendar_color_area_missed_reservation"
+                       class="form-control"
+                       value="{{ calendar_color_area_missed_reservation }}">
+            </div>
+            <div class="col-md-6 help-block light-grey">
+                Color for missed area reservations (global, cannot be changed per area).
+            </div>
+        </div>
+        <div class="form-group">
+            <label class="control-label col-md-3" for="calendar_color_outage">Outage</label>
+            <div class="col-md-3">
+                <input type="color"
+                       id="calendar_color_outage"
+                       name="calendar_color_outage"
+                       class="form-control"
+                       value="{{ calendar_color_outage }}">
+            </div>
+            <div class="col-md-6 help-block light-grey">
+                Color for scheduled tool and area outages (global, cannot be changed per tool or area).
             </div>
         </div>
         <div class="customization-separation" style="margin-bottom: 15px"></div>

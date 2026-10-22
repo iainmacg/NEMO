@@ -5,7 +5,7 @@ from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core.files.base import ContentFile
 from django.db.models import Q
-from django.http import HttpResponseBadRequest
+from django.http import HttpResponseBadRequest, HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.defaultfilters import linebreaksbr
 from django.utils import timezone
@@ -39,6 +39,7 @@ from NEMO.utilities import (
 from NEMO.views.customization import (
     ApplicationCustomization,
     EmailsCustomization,
+    RemoteWorkCustomization,
     ToolCustomization,
     get_media_file_contents,
 )
@@ -55,6 +56,10 @@ def create(request):
     This could be a problem report or shutdown notification.
     """
     user: User = request.user
+
+    if ToolCustomization.get_bool("tool_problem_hide_for_non_staff") and not user.is_any_part_of_staff:
+        return HttpResponseForbidden("You do not have permission to report problems for this tool.")
+
     images_form = TaskImagesForm(request.POST, request.FILES)
     form = TaskForm(user, data=request.POST)
     if not form.is_valid() or not images_form.is_valid():
@@ -79,8 +84,12 @@ def create(request):
 
     task = form.save()
     task_images = save_task_images(request, task)
-    # Only staff can choose not to lock the tool
-    lock_interlock = not (user.is_staff_on_tool(task.tool) and not form.cleaned_data["lock"])
+    # Only staff can choose not to lock the tool, and that's only possible if the option is enabled
+    lock_interlock = (
+        not RemoteWorkCustomization.get_bool("tool_interlock_ask_when_shutting_down_problem")
+        or not user.is_staff_on_tool(task.tool)
+        or form.cleaned_data["lock"]
+    )
 
     save_task(request, task, user, task_images, lock=lock_interlock)
 
@@ -106,7 +115,7 @@ def save_task(request, task: Task, user: User, task_images: List[TaskImages] = N
         # Lock the interlock for this tool.
         try:
             if lock:
-                tool_interlock = Interlock.objects.get(tool__id=task.tool.id)
+                tool_interlock = Interlock.objects.get(tool__id=task.tool.tool_or_parent_id())
                 tool_interlock.lock()
         except Interlock.DoesNotExist:
             pass
@@ -171,10 +180,18 @@ def send_new_task_emails(request, task: Task, user, task_images: List[TaskImages
     user_office_email = EmailsCustomization.get("user_office_email_address")
     message = get_media_file_contents("reservation_warning_email.html")
     if user_office_email and message:
-        upcoming_reservations = Reservation.objects.filter(
-            start__gt=timezone.now(), cancelled=False, tool=task.tool, user__is_staff=False
-        ).select_related("tool", "user__preferences")
-        for reservation in upcoming_reservations:
+        upcoming_reservations = (
+            Reservation.objects.filter(start__gt=timezone.now(), cancelled=False, tool=task.tool, user__is_staff=False)
+            .select_related("tool", "user__preferences")
+            .order_by("start")
+        )
+        unique_users = set()
+        unique_user_reservations = []
+        for r in upcoming_reservations:
+            if r.user_id not in unique_users:
+                unique_users.add(r.user_id)
+                unique_user_reservations.append(r)
+        for reservation in unique_user_reservations:
             if not task.tool.operational:
                 subject = reservation.tool.name + " reservation problem"
                 rendered_message = render_email_template(
@@ -257,8 +274,9 @@ def send_task_updated_email(task, url, task_images: List[TaskImages] = None):
 A task for the {task.tool} was just modified by {task_user}.
 {('<br><br>Estimated resolution:' + format_datetime(task.estimated_resolution_time)) if task.estimated_resolution_time else ''}
 <br/><br/>
-The latest update is at the bottom of the description. The entirety of the task status follows: 
+The latest update is at the bottom of the description. The entirety of the task status follows:
 <br/><br/>
+{('<b>' + task.title + '</b><br/><br/>') if task.title and ToolCustomization.get_bool("tool_problem_title_enabled") else ''}
 Task problem description:<br/>
 {linebreaksbr(task.problem_description)}
 <br/><br/>
@@ -334,6 +352,7 @@ def task_update_form(request, task_id):
             as_timezone(task.estimated_resolution_time) if task.estimated_resolution_time else None
         ),
         "task_statuses": TaskStatus.objects.all(),
+        "next_page": request.GET.get("next_page", "tool_control"),
     }
     return render(request, "tasks/update.html", dictionary)
 

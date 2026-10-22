@@ -8,13 +8,14 @@ from typing import List
 
 from django.conf import settings
 from django.contrib.admin.options import get_content_type_for_model
+from django.db import connection
 from django.test.client import RequestFactory
 from django.test.testcases import TransactionTestCase
 from django.urls import reverse
 from django.urls.resolvers import RegexPattern
 
 from NEMO.models import ToolUsageQuestionType, ToolUsageQuestions, User
-from NEMO.tests.test_utilities import NEMOTestCaseMixin
+from NEMO.tests.test_utilities import NEMOTestCaseMixin, reset_all_oracle_sequences
 from NEMO.utilities import get_full_url
 from NEMO.views.customization import (
     AdjustmentRequestsCustomization,
@@ -35,6 +36,9 @@ url_kwargs_get_post = {
     "kiosk_tool_information": {"kwargs": {"tool_id": 1, "user_id": 1, "back": "back_to_start"}},
     "kiosk_tool_post_comment": {"kwargs": {"tool_id": 1, "user_id": 1, "back": "back_to_start"}},
     "kiosk_tool_report_problem": {"kwargs": {"tool_id": 1, "user_id": 1, "back": "back_to_start"}},
+    "kiosk_tool_usage_questions": {
+        "kwargs": {"tool_id": 3, "user_id": 1, "project_id": 1, "question_type": "pre", "virtual_inputs": "false"}
+    },
     "enable_tool_from_kiosk": {"post": {"tool_id": 1, "customer_id": 1, "project_id": 1}},
     "disable_tool_from_kiosk": {"post": {"tool_id": 1, "customer_id": 1}},
     "reserve_tool_from_kiosk": {"post": {"tool_id": 1, "customer_id": 1, "project_id": 1, "back": ""}},
@@ -101,8 +105,8 @@ url_kwargs_get_post = {
         }
     },
     "toggle_active": {"kwargs": {"kind": "project", "identifier": 3}},
-    "remove_user_from_project": {"post": {"user_id": 3, "project_id": 3}},
-    "add_user_to_project": {"post": {"user_id": 3, "project_id": 3}},
+    "remove_user_from_project": {"login_id": 1, "post": {"user_id": 3, "project_id": 3}},
+    "add_user_to_project": {"login_id": 1, "post": {"user_id": 3, "project_id": 3}},
     "history": {"kwargs": {"item_type": "user", "item_id": 1}},
     "customization": {"kwargs": {"key": "application"}},
     "customize": {"kwargs": {"key": "application"}, "post": {"facility_name": "test facility"}},
@@ -113,9 +117,9 @@ url_kwargs_get_post = {
     "delete_adjustment_request": {"kwargs": {"request_id": 2}, "login_id": 3},
     "adjustment_request_reply": {"kwargs": {"request_id": 2}, "login_id": 3, "post": {"reply_content": "new message"}},
     "create_staff_assistance_request": {"kwargs": {}, "post": {"description": "I need some help"}},
-    "edit_staff_assistance_request": {"kwargs": {"request_id": 2}},
+    "edit_staff_assistance_request": {"login_id": 3, "kwargs": {"request_id": 2}},
     "resolve_staff_assistance_request": {"login_id": 1},
-    "delete_staff_assistance_request": {"kwargs": {"request_id": 2}},
+    "delete_staff_assistance_request": {"login_id": 3, "kwargs": {"request_id": 2}},
     "reopen_staff_assistance_request": {"login_id": 1},
     "staff_assistance_request_reply": {
         "kwargs": {"request_id": 2},
@@ -130,6 +134,13 @@ url_kwargs_get_post = {
             .replace(minute=15)
             .strftime(settings.DATETIME_INPUT_FORMATS[0]),
             "new_end": end_one_day.replace(minute=30).strftime(settings.DATETIME_INPUT_FORMATS[0]),
+        },
+    },
+    "set_reservation_title": {
+        "login_id": 1,
+        "post": {
+            "id": 2,
+            "note": "test title",
         },
     },
     "change_reservation_note": {
@@ -157,6 +168,7 @@ url_kwargs_get_post = {
     "knowledge_base_categories": {"kwargs": {"kind": "user"}},
     "knowledge_base_all_in_one": {"kwargs": {"kind": "user"}},
     "view_user": {"login_id": 1},
+    "user_profile": {"login_id": 1},
     "enable_tool": {"login_id": 1, "kwargs": {"tool_id": 3, "user_id": 1, "project_id": 1, "staff_charge": "false"}},
     "tool_usage_questions": {
         "kwargs": {"tool_id": 3, "user_id": 1, "project_id": 1, "question_type": "pre", "virtual_inputs": "false"}
@@ -203,6 +215,13 @@ urls_to_skip = [
 class URLsTestCase(NEMOTestCaseMixin, TransactionTestCase):
     reset_sequences = True
     fixtures = ["resources/fixtures/splash_pad.json"]
+
+    @classmethod
+    def _pre_setup(cls):
+        if connection.vendor == "oracle":
+            # For Oracle, we need to manually reset sequences to 1 before the fixtures get loaded
+            reset_all_oracle_sequences()
+        super()._pre_setup()
 
     @classmethod
     def setUpTestData(cls):
@@ -403,6 +422,7 @@ def test_urls(test_case, url_patterns, url_params, url_skip, prefix=""):
                         "django.contrib.admin.options",
                     ]
                     or prefix == "admin"
+                    or fun_name == "<lambda>"
                 ):
                     continue
                 pkg_mod = importlib.import_module(pkg)
@@ -446,17 +466,17 @@ def get_annotations(function_def: FunctionDef) -> List[str]:
             name = n.func.attr if isinstance(n.func, ast.Attribute) else n.func.id
         else:
             name = n.attr if isinstance(n, ast.Attribute) else n.id
-        if name == "require_http_methods" and "GET" in [arg.s for arg in n.args[0].elts]:
+        if name == "require_http_methods" and "GET" in [arg.value for arg in n.args[0].elts]:
             name = "require_GET"
-        elif name == "require_http_methods" and "POST" in [arg.s for arg in n.args[0].elts]:
+        elif name == "require_http_methods" and "POST" in [arg.value for arg in n.args[0].elts]:
             name = "require_POST"
-        elif name == "permission_required" and "NEMO.trigger_timed_services" == n.args[0].s:
+        elif name == "permission_required" and "NEMO.trigger_timed_services" == n.args[0].value:
             name = "time_services_required"
-        elif name == "permission_required" and n.args[0].s == "NEMO.kiosk":
+        elif name == "permission_required" and n.args[0].value == "NEMO.kiosk":
             name = "kiosk_required"
-        elif name == "permission_required" and n.args[0].s == "NEMO.kiosk":
+        elif name == "permission_required" and n.args[0].value == "NEMO.kiosk":
             name = "kiosk_required"
-        elif name == "permission_required" and n.args[0].s in [
+        elif name == "permission_required" and n.args[0].value in [
             "NEMO.change_areaaccessrecord",
             "NEMO.add_areaaccessrecord",
         ]:

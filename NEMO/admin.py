@@ -35,6 +35,14 @@ from NEMO.actions import (
     unlock_selected_interlocks,
     waive_selected_charges,
 )
+from NEMO.constants import (
+    CALENDAR_AREA_ACCESS_DEFAULT_COLOR,
+    CALENDAR_AREA_RESERVATION_DEFAULT_COLOR,
+    CALENDAR_PROJECT_DEFAULT_COLOR,
+    CALENDAR_TOOL_RESERVATION_DEFAULT_COLOR,
+    CALENDAR_TOOL_USAGE_DEFAULT_COLOR,
+)
+from NEMO.fields import set_reverse_many_to_many_admin_field
 from NEMO.forms import BuddyRequestForm, RecurringConsumableChargeForm, UserPreferencesForm
 from NEMO.mixins import ModelAdminRedirectMixin, ObjPermissionAdminMixin
 from NEMO.models import (
@@ -61,6 +69,7 @@ from NEMO.models import (
     ConsumableWithdraw,
     ContactInformation,
     ContactInformationCategory,
+    CoreFacility,
     Customization,
     Door,
     EmailLog,
@@ -115,6 +124,7 @@ from NEMO.models import (
     ToolUsageQuestions,
     ToolWaitList,
     TrainingSession,
+    UnplannedOutage,
     UsageEvent,
     User,
     UserDocuments,
@@ -128,8 +138,34 @@ from NEMO.models import (
     record_remote_many_to_many_changes_and_save,
 )
 from NEMO.utilities import admin_get_item, format_daterange
-from NEMO.views.customization import ApplicationCustomization, ProjectsAccountsCustomization
+from NEMO.views.customization import ApplicationCustomization, CoreFacilityCustomization, ProjectsAccountsCustomization
 from NEMO.widgets.dynamic_form import DynamicForm, PostUsageGroupQuestion, admin_render_dynamic_form_preview
+
+
+def has_fk_filter(fk_field_name: str, title: str):
+    filter_title = title
+    param = f"has_{fk_field_name}"
+
+    class HasForeignKeyFilter(admin.SimpleListFilter):
+        title = filter_title
+        parameter_name = param
+
+        def lookups(self, request, model_admin):
+            return (
+                ("yes", f"Has {title}"),
+                ("no", f"No {title}"),
+            )
+
+        def queryset(self, request, queryset):
+            value = self.value()
+            if value == "yes":
+                return queryset.filter(**{f"{fk_field_name}__isnull": False})
+            if value == "no":
+                return queryset.filter(**{f"{fk_field_name}__isnull": True})
+            return queryset
+
+    HasForeignKeyFilter.__name__ = f"Has{title.replace(' ', '')}Filter"
+    return HasForeignKeyFilter
 
 
 # Formset to require at least one inline form
@@ -144,6 +180,67 @@ class AtLeastOneRequiredInlineFormSet(BaseInlineFormSet):
 
 class DocumentModelAdmin(admin.TabularInline):
     extra = 1
+
+
+class CoreFacilityAdminForm(forms.ModelForm):
+    class Meta:
+        model = CoreFacility
+        fields = "__all__"
+
+    core_facility_tools = forms.ModelMultipleChoiceField(
+        queryset=Tool.objects.all(),
+        required=False,
+        widget=FilteredSelectMultiple(verbose_name="Core facility tools", is_stacked=False),
+    )
+    core_facility_areas = forms.ModelMultipleChoiceField(
+        queryset=Area.objects.all(),
+        required=False,
+        widget=FilteredSelectMultiple(verbose_name="Core facility areas", is_stacked=False),
+    )
+    core_facility_consumables = forms.ModelMultipleChoiceField(
+        queryset=Consumable.objects.all(),
+        required=False,
+        widget=FilteredSelectMultiple(verbose_name="Core facility consumable", is_stacked=False),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # We are filtering out already set tools, areas and consumables
+        queryset_filter = Q(core_facility__isnull=True) | Q(core_facility_id=self.instance.pk)
+        if "external_id" in self.fields:
+            self.fields["external_id"].label = CoreFacilityCustomization.get("core_facility_external_id_name")
+
+        # Exclude children tools since their core facility is their parent's
+        if "core_facility_tools" in self.fields:
+            self.fields["core_facility_tools"].queryset = Tool.objects.filter(
+                Q(_core_facility_id=self.instance.pk) | Q(_core_facility__isnull=True)
+            ).exclude(parent_tool__isnull=False)
+            set_reverse_many_to_many_admin_field(self, "core_facility_tools", "tools")
+        if "core_facility_areas" in self.fields:
+            self.fields["core_facility_areas"].queryset = Area.objects.filter(queryset_filter)
+            set_reverse_many_to_many_admin_field(self, "core_facility_areas", "areas")
+        if "core_facility_consumables" in self.fields:
+            self.fields["core_facility_consumables"].queryset = Consumable.objects.filter(queryset_filter)
+            set_reverse_many_to_many_admin_field(self, "core_facility_consumables", "consumables")
+
+
+@register(CoreFacility)
+class CoreFacilityAdmin(admin.ModelAdmin):
+    list_display = ["name", "get_external_id"]
+    form = CoreFacilityAdminForm
+
+    def save_model(self, request, obj: CoreFacility, form, change):
+        super().save_model(request, obj, form, change)
+        if "core_facility_tools" in form.changed_data:
+            obj.tools.set(form.cleaned_data["core_facility_tools"])
+        if "core_facility_areas" in form.changed_data:
+            obj.areas.set(form.cleaned_data["core_facility_areas"])
+        if "core_facility_consumables" in form.changed_data:
+            obj.consumables.set(form.cleaned_data["core_facility_consumables"])
+
+    @admin.display(ordering="external_id")
+    def get_external_id(self, core_facility: CoreFacility):
+        return core_facility.external_id
 
 
 class ToolAdminForm(forms.ModelForm):
@@ -173,7 +270,18 @@ class ToolAdminForm(forms.ModelForm):
     )
 
     _tool_calendar_color = forms.CharField(
-        required=False, max_length=9, initial="#33ad33", widget=forms.TextInput(attrs={"type": "color"})
+        label="Tool usage calendar color",
+        required=False,
+        max_length=9,
+        initial=CALENDAR_TOOL_USAGE_DEFAULT_COLOR,
+        widget=forms.TextInput(attrs={"type": "color"}),
+    )
+    _tool_reservation_calendar_color = forms.CharField(
+        label="Tool reservation calendar color",
+        required=False,
+        max_length=9,
+        initial=CALENDAR_TOOL_RESERVATION_DEFAULT_COLOR,
+        widget=forms.TextInput(attrs={"type": "color"}),
     )
 
     def __init__(self, *args, **kwargs):
@@ -183,10 +291,9 @@ class ToolAdminForm(forms.ModelForm):
             self.fields["_interlock"].queryset = Interlock.objects.filter(
                 Q(id=self.instance._interlock_id) | Q(tool__isnull=True, door__isnull=True)
             )
-        if self.instance.pk:
-            self.fields["qualified_users"].initial = self.instance.user_set.all()
-            self.fields["required_resources"].initial = self.instance.required_resource_set.all()
-            self.fields["nonrequired_resources"].initial = self.instance.nonrequired_resource_set.all()
+        set_reverse_many_to_many_admin_field(self, "qualified_users", "user_set")
+        set_reverse_many_to_many_admin_field(self, "required_resources", "required_resource_set")
+        set_reverse_many_to_many_admin_field(self, "nonrequired_resources", "nonrequired_resource_set")
 
     def clean(self):
         cleaned_data = super().clean()
@@ -215,6 +322,7 @@ class ToolAdmin(admin.ModelAdmin):
         "visible",
         "operational_display",
         "_operation_mode",
+        "_core_facility",
         "problematic",
         "is_configurable",
         "id",
@@ -227,6 +335,7 @@ class ToolAdmin(admin.ModelAdmin):
         "_operation_mode",
         "_category",
         "_location",
+        ("_core_facility", admin.RelatedOnlyFieldListFilter),
         ("_requires_area_access", admin.RelatedOnlyFieldListFilter),
     )
     autocomplete_fields = [
@@ -245,15 +354,24 @@ class ToolAdmin(admin.ModelAdmin):
                     "parent_tool",
                     "_category",
                     "_operation_mode",
+                    "_core_facility",
                     "qualified_users",
-                    "_qualifications_never_expire",
                     "_problem_shutdown_enabled",
                 )
             },
         ),
         (
             "Additional Information",
-            {"fields": ("_description", "_serial", "_image", "_tool_calendar_color", "_properties")},
+            {
+                "fields": (
+                    "_description",
+                    "_serial",
+                    "_image",
+                    "_tool_calendar_color",
+                    "_tool_reservation_calendar_color",
+                    "_properties",
+                )
+            },
         ),
         ("Current state", {"fields": ("visible", "_operational")}),
         (
@@ -271,7 +389,17 @@ class ToolAdmin(admin.ModelAdmin):
             },
         ),
         ("Approval", {"fields": ("_adjustment_request_reviewers",)}),
-        ("Reservation", {"fields": ("_reservation_horizon", "_missed_reservation_threshold", "_abuse_weight")}),
+        (
+            "Reservation",
+            {
+                "fields": (
+                    "_reservation_horizon",
+                    "_missed_reservation_threshold",
+                    "_late_cancellation_reservation_threshold",
+                    "_abuse_weight",
+                )
+            },
+        ),
         (
             "Usage policy",
             {
@@ -286,6 +414,17 @@ class ToolAdmin(admin.ModelAdmin):
                     "_maximum_future_reservations",
                     "_minimum_time_between_reservations",
                     "_maximum_future_reservation_time",
+                )
+            },
+        ),
+        (
+            "Qualification expiration",
+            {
+                "fields": (
+                    "_qualification_reminder_days",
+                    "_qualification_expiration_days",
+                    "_qualification_expiration_never_used_days",
+                    "_qualification_notification_email",
                 )
             },
         ),
@@ -448,15 +587,36 @@ class ToolUsageQuestionsAdmin(admin.ModelAdmin):
 
 
 @register(ToolWaitList)
-class ToolWaitList(admin.ModelAdmin):
+class ToolWaitListAdmin(admin.ModelAdmin):
     list_display = ["tool", "user", "date_entered", "date_exited", "expired", "deleted"]
     list_filter = ["deleted", "expired", "tool"]
+    autocomplete_fields = ["tool", "user"]
+
+
+class ToolQualificationGroupAdminForm(forms.ModelForm):
+    class Meta:
+        model = ToolQualificationGroup
+        fields = "__all__"
+
+    def clean(self):
+        cleaned_data = super().clean()
+        tools = cleaned_data.get("tools")
+        training_charge_tool = cleaned_data.get("training_charge_tool")
+
+        if training_charge_tool and tools and training_charge_tool not in tools:
+            raise forms.ValidationError(
+                {"training_charge_tool": "The training charge tool must be in the list of tools."}
+            )
+
+        return cleaned_data
 
 
 @register(ToolQualificationGroup)
-class ToolQualificationGroup(admin.ModelAdmin):
-    list_display = ["name", "get_tools"]
+class ToolQualificationGroupAdmin(admin.ModelAdmin):
+    list_display = ["name", "get_tools", "training_charge_tool"]
     filter_horizontal = ["tools"]
+    autocomplete_fields = ["training_charge_tool"]
+    form = ToolQualificationGroupAdminForm
 
     @admin.display(description="Tools", ordering="tools")
     def get_tools(self, obj: ToolQualificationGroup):
@@ -469,7 +629,16 @@ class AreaAdminForm(MPTTAdminForm):
         fields = "__all__"
 
     area_calendar_color = forms.CharField(
-        required=False, max_length=9, initial="#88B7CD", widget=forms.TextInput(attrs={"type": "color"})
+        required=False,
+        max_length=9,
+        initial=CALENDAR_AREA_ACCESS_DEFAULT_COLOR,
+        widget=forms.TextInput(attrs={"type": "color"}),
+    )
+    area_reservation_calendar_color = forms.CharField(
+        required=False,
+        max_length=9,
+        initial=CALENDAR_AREA_RESERVATION_DEFAULT_COLOR,
+        widget=forms.TextInput(attrs={"type": "color"}),
     )
 
 
@@ -482,6 +651,7 @@ class AreaAdmin(DraggableMPTTAdmin):
         "parent_area",
         "category",
         "requires_reservation",
+        "core_facility",
         "maximum_capacity",
         "reservation_warning",
         "buddy_system_allowed",
@@ -489,8 +659,8 @@ class AreaAdmin(DraggableMPTTAdmin):
     )
     filter_horizontal = ["adjustment_request_reviewers", "access_request_reviewers"]
     fieldsets = (
-        (None, {"fields": ("name", "parent_area", "category", "reservation_email", "abuse_email")}),
-        ("Additional Information", {"fields": ("area_calendar_color",)}),
+        (None, {"fields": ("name", "parent_area", "category", "reservation_email", "abuse_email", "core_facility")}),
+        ("Additional Information", {"fields": ("area_calendar_color", "area_reservation_calendar_color")}),
         (
             "Area access",
             {
@@ -514,7 +684,17 @@ class AreaAdmin(DraggableMPTTAdmin):
             },
         ),
         ("Approval", {"fields": ("adjustment_request_reviewers", "access_request_reviewers")}),
-        ("Reservation", {"fields": ("reservation_horizon", "missed_reservation_threshold", "abuse_weight")}),
+        (
+            "Reservation",
+            {
+                "fields": (
+                    "reservation_horizon",
+                    "missed_reservation_threshold",
+                    "late_cancellation_reservation_threshold",
+                    "abuse_weight",
+                )
+            },
+        ),
         (
             "Policy",
             {
@@ -534,7 +714,11 @@ class AreaAdmin(DraggableMPTTAdmin):
         ),
     )
     list_display_links = ("indented_title",)
-    list_filter = ("requires_reservation", ("parent_area", TreeRelatedFieldListFilter))
+    list_filter = (
+        "requires_reservation",
+        ("parent_area", TreeRelatedFieldListFilter),
+        ("core_facility", admin.RelatedOnlyFieldListFilter),
+    )
     search_fields = ("name",)
     actions = [rebuild_area_tree]
 
@@ -578,7 +762,10 @@ class TrainingSessionAdmin(ObjPermissionAdminMixin, ModelAdminRedirectMixin, adm
         "type",
         "waived",
         ("tool", admin.RelatedOnlyFieldListFilter),
+        ("project__project_types", admin.RelatedOnlyFieldListFilter),
+        ("project__account__type", admin.RelatedOnlyFieldListFilter),
         ("project", admin.RelatedOnlyFieldListFilter),
+        ("project__account", admin.RelatedOnlyFieldListFilter),
         ("trainer", admin.RelatedOnlyFieldListFilter),
         ("trainee", admin.RelatedOnlyFieldListFilter),
     )
@@ -597,26 +784,66 @@ class TrainingSessionAdmin(ObjPermissionAdminMixin, ModelAdminRedirectMixin, adm
 
 @register(StaffCharge)
 class StaffChargeAdmin(ObjPermissionAdminMixin, ModelAdminRedirectMixin, admin.ModelAdmin):
-    list_display = ("id", "staff_member", "customer", "start", "end", "waived")
+    list_display = (
+        "id",
+        "staff_member",
+        "customer",
+        "project",
+        "core_facility",
+        "start",
+        "end",
+        "waived",
+        "has_area_record",
+        "has_usage_event",
+    )
     list_filter = (
         "start",
         "waived",
         ("customer", admin.RelatedOnlyFieldListFilter),
         ("staff_member", admin.RelatedOnlyFieldListFilter),
+        ("core_facility", admin.RelatedOnlyFieldListFilter),
+        has_fk_filter("areaaccessrecord", "Area Record"),
+        has_fk_filter("usageevent", "Usage Event"),
+        ("project__project_types", admin.RelatedOnlyFieldListFilter),
+        ("project__account__type", admin.RelatedOnlyFieldListFilter),
+        ("project", admin.RelatedOnlyFieldListFilter),
+        ("project__account", admin.RelatedOnlyFieldListFilter),
     )
     date_hierarchy = "start"
     autocomplete_fields = ["staff_member", "customer", "project", "validated_by", "waived_by"]
     actions = [waive_selected_charges]
+    search_fields = ["=id"]
+
+    @admin.display(boolean=True, description="Usage Event")
+    def has_usage_event(self, obj) -> bool:
+        return obj.usageevent_set.exists()
+
+    @admin.display(boolean=True, description="Area Record")
+    def has_area_record(self, obj) -> bool:
+        return obj.areaaccessrecord_set.exists()
 
 
 @register(AreaAccessRecord)
 class AreaAccessRecordAdmin(ObjPermissionAdminMixin, ModelAdminRedirectMixin, admin.ModelAdmin):
-    list_display = ("id", "customer", "area", "project", "start", "end", "waived")
-    list_filter = (("area", TreeRelatedFieldListFilter), "start", "waived")
+    list_display = ("id", "customer", "area", "project", "start", "end", "waived", "has_staff_charge")
+    list_filter = (
+        ("area", TreeRelatedFieldListFilter),
+        "start",
+        "waived",
+        has_fk_filter("staff_charge", "Staff Charge"),
+        ("project__project_types", admin.RelatedOnlyFieldListFilter),
+        ("project__account__type", admin.RelatedOnlyFieldListFilter),
+        ("project", admin.RelatedOnlyFieldListFilter),
+        ("project__account", admin.RelatedOnlyFieldListFilter),
+    )
     date_hierarchy = "start"
-    autocomplete_fields = ["customer", "project", "validated_by", "waived_by"]
+    autocomplete_fields = ["customer", "project", "validated_by", "waived_by", "staff_charge"]
     readonly_fields = ["has_ended"]
     actions = [waive_selected_charges]
+
+    @admin.display(boolean=True, description="Staff Charge")
+    def has_staff_charge(self, obj) -> bool:
+        return obj.staff_charge_id is not None
 
 
 @register(Configuration)
@@ -661,8 +888,7 @@ class AccountAdminForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if self.instance.pk:
-            self.fields["managers"].initial = self.instance.manager_set.all()
+        set_reverse_many_to_many_admin_field(self, "managers", "manager_set")
 
 
 @register(Account)
@@ -689,6 +915,13 @@ class ProjectAdminForm(forms.ModelForm):
         model = Project
         fields = "__all__"
 
+    project_calendar_color = forms.CharField(
+        required=False,
+        max_length=9,
+        initial=CALENDAR_PROJECT_DEFAULT_COLOR,
+        widget=forms.TextInput(attrs={"type": "color"}),
+    )
+
     members = forms.ModelMultipleChoiceField(
         queryset=User.objects.all(),
         required=False,
@@ -707,9 +940,8 @@ class ProjectAdminForm(forms.ModelForm):
             self.fields["application_identifier"].label = ProjectsAccountsCustomization.get(
                 "project_application_identifier_name"
             )
-        if self.instance.pk:
-            self.fields["members"].initial = self.instance.user_set.all()
-            self.fields["managers"].initial = self.instance.manager_set.all()
+        set_reverse_many_to_many_admin_field(self, "members", "user_set")
+        set_reverse_many_to_many_admin_field(self, "managers", "manager_set")
 
     def clean_project_types(self):
         data = self.cleaned_data["project_types"]
@@ -811,7 +1043,7 @@ class ReservationAdmin(ObjPermissionAdminMixin, ModelAdminRedirectMixin, admin.M
         "project",
         "start",
         "end",
-        "duration",
+        "duration_rounded",
         "cancelled",
         "missed",
         "shortened",
@@ -826,11 +1058,19 @@ class ReservationAdmin(ObjPermissionAdminMixin, ModelAdminRedirectMixin, admin.M
         ("tool", admin.RelatedOnlyFieldListFilter),
         ("area", TreeRelatedFieldListFilter),
         ("user", admin.RelatedOnlyFieldListFilter),
+        ("project__project_types", admin.RelatedOnlyFieldListFilter),
+        ("project__account__type", admin.RelatedOnlyFieldListFilter),
+        ("project", admin.RelatedOnlyFieldListFilter),
+        ("project__account", admin.RelatedOnlyFieldListFilter),
     )
     date_hierarchy = "start"
     inlines = [ConfigurationOptionInline]
-    autocomplete_fields = ["user", "creator", "tool", "project", "cancelled_by", "validated_by", "waived_by"]
+    autocomplete_fields = ["user", "creator", "tool", "area", "project", "cancelled_by", "validated_by", "waived_by"]
     actions = [waive_selected_charges]
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        return qs.prefetch_related("tool", "area", "project")
 
 
 class ReservationQuestionsForm(forms.ModelForm):
@@ -902,13 +1142,41 @@ class ReservationQuestionsAdmin(admin.ModelAdmin):
 
 @register(UsageEvent)
 class UsageEventAdmin(ObjPermissionAdminMixin, ModelAdminRedirectMixin, admin.ModelAdmin):
-    list_display = ("id", "tool", "user", "operator", "project", "start", "end", "duration", "remote_work", "waived")
-    list_filter = ("remote_work", "training", "start", "end", "waived", ("tool", admin.RelatedOnlyFieldListFilter))
+    list_display = (
+        "id",
+        "tool",
+        "user",
+        "operator",
+        "project",
+        "start",
+        "end",
+        "duration",
+        "remote_work",
+        "waived",
+        "has_staff_charge",
+    )
+    list_filter = (
+        "remote_work",
+        "training",
+        "start",
+        "end",
+        "waived",
+        has_fk_filter("staff_charge", "Staff Charge"),
+        ("tool", admin.RelatedOnlyFieldListFilter),
+        ("project__project_types", admin.RelatedOnlyFieldListFilter),
+        ("project__account__type", admin.RelatedOnlyFieldListFilter),
+        ("project", admin.RelatedOnlyFieldListFilter),
+        ("project__account", admin.RelatedOnlyFieldListFilter),
+    )
     date_hierarchy = "start"
-    autocomplete_fields = ["tool", "user", "operator", "project", "validated_by", "waived_by"]
+    autocomplete_fields = ["tool", "user", "operator", "project", "validated_by", "waived_by", "staff_charge"]
     readonly_fields = ["has_ended"]
     actions = [waive_selected_charges]
     search_fields = ["user__username", "user__first_name", "user__last_name", "tool__name"]
+
+    @admin.display(boolean=True, description="Staff Charge")
+    def has_staff_charge(self, obj) -> bool:
+        return obj.staff_charge_id is not None
 
 
 @register(Consumable)
@@ -917,6 +1185,7 @@ class ConsumableAdmin(admin.ModelAdmin):
         "name",
         "quantity",
         "category",
+        "core_facility",
         "visible",
         "reusable",
         "allow_self_checkout",
@@ -924,7 +1193,13 @@ class ConsumableAdmin(admin.ModelAdmin):
         "reminder_email",
         "id",
     )
-    list_filter = ("visible", ("category", admin.RelatedOnlyFieldListFilter), "reusable", "allow_self_checkout")
+    list_filter = (
+        "visible",
+        ("category", admin.RelatedOnlyFieldListFilter),
+        "reusable",
+        "allow_self_checkout",
+        ("core_facility", admin.RelatedOnlyFieldListFilter),
+    )
     filter_horizontal = ["self_checkout_only_users"]
     search_fields = ("name",)
     readonly_fields = ("reminder_threshold_reached",)
@@ -938,9 +1213,18 @@ class ConsumableCategoryAdmin(admin.ModelAdmin):
 @register(ConsumableWithdraw)
 class ConsumableWithdrawAdmin(ObjPermissionAdminMixin, ModelAdminRedirectMixin, admin.ModelAdmin):
     list_display = ("id", "customer", "merchant", "consumable", "quantity", "project", "date", "waived")
-    list_filter = ("date", "waived", ("consumable", admin.RelatedOnlyFieldListFilter))
+    list_filter = (
+        "date",
+        "waived",
+        ("consumable__category", admin.RelatedOnlyFieldListFilter),
+        ("consumable", admin.RelatedOnlyFieldListFilter),
+        ("project__project_types", admin.RelatedOnlyFieldListFilter),
+        ("project__account__type", admin.RelatedOnlyFieldListFilter),
+        ("project", admin.RelatedOnlyFieldListFilter),
+        ("project__account", admin.RelatedOnlyFieldListFilter),
+    )
     date_hierarchy = "date"
-    autocomplete_fields = ["customer", "merchant", "consumable", "project", "validated_by", "waived_by"]
+    autocomplete_fields = ["customer", "merchant", "consumable", "project", "validated_by", "waived_by", "usage_event"]
     actions = [waive_selected_charges]
 
 
@@ -1063,6 +1347,7 @@ class InterlockCardCategoryAdmin(admin.ModelAdmin):
 class TaskAdmin(admin.ModelAdmin):
     list_display = (
         "id",
+        "title",
         "urgency",
         "tool",
         "creator",
@@ -1084,6 +1369,7 @@ class TaskAdmin(admin.ModelAdmin):
     )
     date_hierarchy = "creation_time"
     autocomplete_fields = ["tool", "creator", "last_updated_by", "resolver"]
+    search_fields = ["title", "tool__name", "creator__first_name", "creator__last_name", "creator__username"]
 
 
 @register(TaskCategory)
@@ -1114,6 +1400,7 @@ class TaskHistoryAdmin(admin.ModelAdmin):
 @register(TaskImages)
 class TaskImagesAdmin(admin.ModelAdmin):
     list_display = ("id", "get_tool", "task", "uploaded_at")
+    readonly_fields = ["uploaded_at"]
 
     @admin.display(ordering="tool", description="Tool Name")
     def get_tool(self, task_image: TaskImages):
@@ -1145,6 +1432,7 @@ class ResourceAdmin(admin.ModelAdmin):
     list_display = ("name", "category", "available")
     list_filter = ("available", "category")
     filter_horizontal = ("fully_dependent_tools", "partially_dependent_tools", "dependent_areas")
+    search_fields = ("name", "category__name", "restriction_message")
 
 
 @register(ActivityHistory)
@@ -1239,14 +1527,12 @@ class UserAdminForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.instance: User = self.instance
         self.fields["training_required"].label = f'{ApplicationCustomization.get("facility_rules_name")} required'
-        if self.instance.pk:
-            self.fields["primary_owner_on_tools"].initial = self.instance.primary_tool_owner.all()
-            self.fields["tool_qualifications"].initial = self.instance.qualifications.all()
-            self.fields["backup_owner_on_tools"].initial = self.instance.backup_for_tools.all()
-            self.fields["superuser_on_tools"].initial = self.instance.superuser_for_tools.all()
-            self.fields["staff_on_tools"].initial = self.instance.staff_for_tools.all()
+        set_reverse_many_to_many_admin_field(self, "tool_qualifications", "qualifications")
+        set_reverse_many_to_many_admin_field(self, "backup_owner_on_tools", "backup_for_tools")
+        set_reverse_many_to_many_admin_field(self, "superuser_on_tools", "superuser_for_tools")
+        set_reverse_many_to_many_admin_field(self, "staff_on_tools", "staff_for_tools")
+        set_reverse_many_to_many_admin_field(self, "primary_owner_on_tools", "primary_tool_owner")
 
     def clean_managed_users(self):
         managed_users = self.cleaned_data["managed_users"]
@@ -1544,9 +1830,8 @@ class PhysicalAccessLevelForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if self.instance.pk:
-            self.fields["authorized_users"].initial = self.instance.user_set.all()
-            self.fields["closures"].initial = self.instance.closure_set.all()
+        set_reverse_many_to_many_admin_field(self, "authorized_users", "user_set")
+        set_reverse_many_to_many_admin_field(self, "closures", "closure_set")
 
     def clean(self):
         cleaned_data = super().clean()
@@ -1752,8 +2037,14 @@ class ContactInformationCategoryAdmin(admin.ModelAdmin):
 
 @register(ContactInformation)
 class ContactInformationAdmin(admin.ModelAdmin):
-    list_display = ("name", "category", "user")
+    list_display = ("name", "category", "user", "image_thumbnail")
     autocomplete_fields = ["user"]
+
+    @admin.display(ordering="image", description="Image")
+    def image_thumbnail(self, obj):
+        if obj.image:
+            return mark_safe(f'<img src="{obj.image.url}" height="32px" />')
+        return "No image"
 
 
 @register(LandingPageChoice)
@@ -1761,6 +2052,7 @@ class LandingPageChoiceAdmin(admin.ModelAdmin):
     list_display = (
         "display_order",
         "name",
+        "icon_thumbnail",
         "url",
         "get_view_permissions",
         "open_in_new_tab",
@@ -1778,6 +2070,12 @@ class LandingPageChoiceAdmin(admin.ModelAdmin):
                 for role_str in obj.view_permissions
             )
         )
+
+    @admin.display(ordering="image", description="Icon")
+    def icon_thumbnail(self, obj):
+        if obj.image:
+            return mark_safe(f'<img src="{obj.image.url}" height="32px" />')
+        return "No icon"
 
 
 @register(Customization)
@@ -1801,6 +2099,24 @@ class ScheduledOutageAdmin(admin.ModelAdmin):
         ("creator", admin.RelatedOnlyFieldListFilter),
     )
     autocomplete_fields = ["tool", "creator"]
+    date_hierarchy = "start"
+
+
+@register(UnplannedOutage)
+class UnplannedOutageAdmin(admin.ModelAdmin):
+    list_display = ("id", "tool", "resource", "start", "end")
+    list_filter = (("tool", admin.RelatedOnlyFieldListFilter), ("resource", admin.RelatedOnlyFieldListFilter))
+    autocomplete_fields = ["tool", "resource"]
+    date_hierarchy = "start"
+
+    def has_delete_permission(self, request, obj=None):
+        return request.user.is_superuser
+
+    def has_add_permission(self, request):
+        return request.user.is_superuser
+
+    def has_change_permission(self, request, obj=None):
+        return request.user.is_superuser
 
 
 @register(News)
@@ -1977,8 +2293,7 @@ class ChemicalHazardAdminForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if self.instance.pk:
-            self.fields["chemicals"].initial = self.instance.chemical_set.all()
+        set_reverse_many_to_many_admin_field(self, "chemicals", "chemical_set")
 
     def clean(self):
         cleaned_data = super().clean()
@@ -1995,12 +2310,18 @@ class ChemicalHazardAdminForm(forms.ModelForm):
 @register(ChemicalHazard)
 class ChemicalHazardAdmin(admin.ModelAdmin):
     form = ChemicalHazardAdminForm
-    list_display = ("name", "display_order")
+    list_display = ("name", "display_order", "logo_thumbnail")
 
     def save_model(self, request, obj: ChemicalHazard, form, change):
         super().save_model(request, obj, form, change)
         if "chemicals" in form.changed_data:
             obj.chemical_set.set(form.cleaned_data["chemicals"])
+
+    @admin.display(ordering="logo", description="Logo")
+    def logo_thumbnail(self, obj):
+        if obj.logo:
+            return mark_safe(f'<img src="{obj.logo.url}" height="32px" />')
+        return "No logo"
 
 
 @register(Chemical)
@@ -2103,8 +2424,7 @@ class CustomGroupAdminForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if self.instance.pk:
-            self.fields["users"].initial = self.instance.user_set.all()
+        set_reverse_many_to_many_admin_field(self, "users", "user_set")
 
     def _save_m2m(self):
         super()._save_m2m()
@@ -2130,8 +2450,7 @@ class PermissionAdminForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if self.instance.pk:
-            self.fields["users"].initial = self.instance.user_set.all()
+        set_reverse_many_to_many_admin_field(self, "users", "user_set")
 
     def _save_m2m(self):
         super()._save_m2m()

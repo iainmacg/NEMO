@@ -12,6 +12,8 @@ from django.shortcuts import render
 from packaging.requirements import Requirement
 from packaging.version import InvalidVersion, Version
 
+from NEMO.constants import EXTRA_POLICIES_SETTING
+
 utils_logger = getLogger(__name__)
 
 
@@ -39,6 +41,8 @@ def check_unique_plugin_ids(app_configs, silent=False, **kwargs):
 
                 if plugin_id is None:
                     continue
+
+                plugin_id = str(plugin_id)
 
                 # Check for conflicting plugin_ids
                 if plugin_id in plugin_ids:
@@ -148,3 +152,44 @@ def add_dynamic_choices_to_choice_field(field: Field, new_choices: List[Tuple[Un
         field.choices = original_choices
     except FieldDoesNotExist:
         utils_logger.exception("Error adding dynamic choices: {}".format(new_choices))
+
+
+def add_extra_policy_class(policy_class_name: str):
+    from NEMO import policy
+
+    current_policies = list(getattr(settings, EXTRA_POLICIES_SETTING, []))
+
+    # Append only if not already present (prevents duplicates on reload)
+    if policy_class_name not in current_policies:
+        current_policies.append(policy_class_name)
+        setattr(settings, EXTRA_POLICIES_SETTING, current_policies)
+
+    # Replace private attribute to avoid stale references
+    policy.policy_class._policies = policy.get_policy_classes()
+
+
+def add_inline_to_admin_class(model_class, inline_class):
+    from django.apps import apps
+
+    if not apps.is_installed("django.contrib.admin"):
+        return
+
+    from django.contrib import admin
+
+    if model_class not in admin.site._registry:
+        return
+
+    OriginalModelAdminClass = admin.site._registry[model_class].__class__
+
+    if inline_class in list(OriginalModelAdminClass.inlines):
+        return
+
+    NewModelAdminClassWithInline = type(
+        f"{model_class.__name__}AdminWithInline",
+        (OriginalModelAdminClass,),
+        {"inlines": [inline_class] + list(OriginalModelAdminClass.inlines)},
+    )
+
+    # re-register
+    admin.site.unregister(model_class)
+    admin.site.register(model_class, NewModelAdminClassWithInline)

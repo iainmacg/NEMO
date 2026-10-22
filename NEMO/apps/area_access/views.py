@@ -20,7 +20,9 @@ from NEMO.exceptions import (
     ProjectChargeException,
     ReservationRequiredUserError,
     ScheduledOutageInProgressError,
+    TrainingRequiredUserError,
     UnavailableResourcesUserError,
+    UserAccessError,
 )
 from NEMO.models import (
     Area,
@@ -105,6 +107,11 @@ def login_to_area(request, door_id):
         log.save()
         return render(request, "area_access/inactive.html")
 
+    except TrainingRequiredUserError:
+        log.details = "The user has not completed their mandatory training, preventing them from entering an access controlled area."
+        log.save()
+        return render(request, "area_access/training_required.html")
+
     except NoActiveProjectsForUserError:
         log.details = "The user has no active projects, preventing them from entering an access controlled area."
         log.save()
@@ -121,6 +128,11 @@ def login_to_area(request, door_id):
         log.save()
         message = f"You have not been granted physical access to any {facility_name} area. Please visit the User Office if you believe this is an error."
         return render(request, "area_access/physical_access_denied.html", {"message": message})
+
+    except UserAccessError as e:
+        log.details = f"This user raised the following error: {e.msg}"
+        log.save()
+        return render(request, "area_access/physical_access_denied.html", {"message": e.msg})
 
     max_capacity_reached = False
     reservation_requirement_failed = False

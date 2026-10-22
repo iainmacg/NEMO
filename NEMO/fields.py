@@ -8,7 +8,8 @@ from typing import List, Tuple
 import fastjsonschema
 from django import forms
 from django.conf import settings
-from django.contrib.admin.widgets import AutocompleteMixin, FilteredSelectMultiple
+from django.contrib import admin
+from django.contrib.admin.widgets import AutocompleteMixin, FilteredSelectMultiple, RelatedFieldWidgetWrapper
 from django.contrib.auth.models import Group, Permission
 from django.core import validators
 from django.core.cache import cache
@@ -16,6 +17,7 @@ from django.core.exceptions import FieldError, ValidationError
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 from django.db.models.signals import post_delete, post_save
+from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 
 from NEMO.typing import QuerySetType
@@ -50,15 +52,26 @@ class IsEmpty(models.lookups.BuiltinLookup):
 
     def as_sql(self, compiler, connection):
         sql, params = compiler.compile(self.lhs)
-        condition = self.rhs if isinstance(self.rhs, bool) else bool(strtobool(self.rhs))
+        condition = self.rhs if isinstance(self.rhs, bool) else bool(strtobool(str(self.rhs)))
+
+        is_oracle = getattr(connection, "vendor", "") == "oracle"
+        is_textfield = hasattr(self.lhs, "field") and isinstance(self.lhs.field, models.TextField)
+
         if condition:
-            return "%s IS NULL or %s = ''" % (sql, sql), params
+            # Looking for EMPTY
+            if is_oracle and is_textfield:
+                return "(%s IS NULL OR dbms_lob.getlength(%s) = 0)" % (sql, sql), params + params
+            # For ALL other databases, and Oracle CharFields (the = '' is harmless here)
+            return "(%s IS NULL OR %s = '')" % (sql, sql), params + params
         else:
-            if getattr(connection, "vendor", "") == "oracle" and isinstance(self.lhs.field, models.TextField):
-                # we need to handle textfields for oracle differently as they are set as clobs
-                return "length(%s) <> 0" % sql, params
-            else:
-                return "%s <> ''" % sql, params
+            # Looking for NOT EMPTY
+            if is_oracle:
+                if is_textfield:
+                    return "(%s IS NOT NULL AND dbms_lob.getlength(%s) > 0)" % (sql, sql), params + params
+                # We MUST omit the `<> ''` check here to avoid the Oracle NULL trap
+                return "%s IS NOT NULL" % sql, params
+            # For ALL other databases
+            return "(%s IS NOT NULL AND %s <> '')" % (sql, sql), params + params
 
 
 class MultiEmailWidget(forms.TextInput):
@@ -161,7 +174,7 @@ class AdminAutocompleteSelectWidget(forms.Select):
 
     def render(self, name, value, attrs=None, renderer=None):
         select_html = super().render(name, value, attrs, renderer)
-        select2_script = f"""
+        select2_script = mark_safe(f"""
         <script type="text/javascript">
             (function($) {{
                 $(document).ready(function() {{
@@ -169,7 +182,7 @@ class AdminAutocompleteSelectWidget(forms.Select):
                 }});
             }})(django.jQuery);
         </script>
-        """
+        """)
         return select_html + select2_script
 
     @property
@@ -262,6 +275,14 @@ class JsonField(models.JSONField):
             ),
         )
         return super().formfield(**kwargs)
+
+
+class WrappedFilteredSelectMultiple(FilteredSelectMultiple):
+    """Wrapper to make the custom FilteredSelectMultiple widget render like the regular ManyToMany one"""
+
+    def render(self, name, value, attrs=None, renderer=None):
+        html = super().render(name, value, attrs, renderer)
+        return mark_safe(f'<div class="related-widget-wrapper">{html}</div>')
 
 
 class DynamicChoicesMixin:
@@ -486,7 +507,7 @@ class MultiRoleGroupPermissionChoiceField(RoleGroupPermissionChoiceField):
     def formfield(self, **kwargs):
         choices = kwargs.pop("choices", self.role_choices(admin_display=True, include_blank=False))
         is_stacked = kwargs.pop("is_stacked", False)
-        kwargs["widget"] = FilteredSelectMultiple("Roles", is_stacked=is_stacked)
+        kwargs["widget"] = WrappedFilteredSelectMultiple("Roles", is_stacked=is_stacked)
         return super(models.TextField, self).formfield(
             choices=choices, form_class=CommaSeparatedTextMultipleChoiceField, **kwargs
         )
@@ -522,6 +543,33 @@ class MultiRoleGroupPermissionChoiceField(RoleGroupPermissionChoiceField):
     def get_choices(self, *args, **kwargs):
         kwargs["include_blank"] = False
         return super().get_choices(*args, **kwargs)
+
+
+class MockManyToManyReverseRelationAdmin:
+    """
+    A mock relation object to trick RelatedFieldWidgetWrapper
+    into generating popup URLs for the reverse model.
+    """
+
+    def __init__(self, target_model):
+        self.model = target_model
+        self.limit_choices_to = {}
+        self.multiple = True
+
+    def get_related_field(self):
+        return self.model._meta.pk
+
+
+def set_reverse_many_to_many_admin_field(admin_form: forms.ModelForm, field_name: str, reverse_field_name: str):
+    field = admin_form.fields[field_name]
+
+    if admin_form.instance.pk and hasattr(admin_form.instance, reverse_field_name):
+        field.initial = getattr(admin_form.instance, reverse_field_name).all()
+
+    field.widget.choices = field.choices
+
+    rel = MockManyToManyReverseRelationAdmin(field.queryset.model)
+    field.widget = RelatedFieldWidgetWrapper(widget=field.widget, rel=rel, admin_site=admin.site)
 
 
 RoleGroupPermissionChoiceField.connect_signals()

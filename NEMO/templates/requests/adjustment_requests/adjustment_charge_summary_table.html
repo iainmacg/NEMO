@@ -21,13 +21,24 @@
                 Adjustment Request #{{ request_obj.id }}</strong>
             </div>
             <div id="adjustment_right_{{ request_obj.id }}" class="col-xs-6 text-right" style="padding-right: 0">
-                {% if request_obj.status != status_pending %}
+                {% if request_obj.status == status_approved %}
+                    {% if request_obj.applied and request_obj.applied_by == request_obj.reviewer %}
+                        {{ request_obj.get_status_display }} and applied by {{ request_obj.reviewer.get_name }}
+                    {% elif request_obj.applied %}
+                        {{ request_obj.get_status_display }} by {{ request_obj.reviewer.get_name }} and applied by {{ request_obj.applied_by.get_name }}
+                    {% else %}
+                        {{ request_obj.get_status_display }} by {{ request_obj.reviewer.get_name }}
+                    {% endif %}
+                {% elif request_obj.status == status_denied %}
                     {{ request_obj.get_status_display }} by {{ request_obj.reviewer.get_name }}
-                    {% if request_obj.status == status_denied and request_obj.manager_note %}
-                        <i class="glyphicon glyphicon-info-sign" title="{{ request_obj.manager_note }}"></i>
+                    {% if request_obj.manager_note %}
+                        <i aria-hidden="true" class="glyphicon glyphicon-info-sign" title="{{ request_obj.manager_note }}"></i>
                     {% endif %}
                 {% endif %}
-                <i class="glyphicon glyphicon-chevron-down chevron" style="color: inherit; padding-right: inherit"></i>
+                <i aria-hidden="true"
+                   class="glyphicon glyphicon-chevron-down chevron"
+                   style="color: inherit;
+                          padding-right: inherit"></i>
             </div>
         </div>
         <div class="panel-body clearfix">
@@ -124,10 +135,10 @@
                                                 <li>
                                                     <strong style="width: 90px; display: inline-block;"><u>Project:</u></strong>
                                                     {% if request_obj.get_original_project %}
-                                                        <span class="danger-highlight"><del>{{ request_obj.get_original_project }}</del></span>
+                                                        <span class="danger-highlight"><del>{{ request_obj.get_original_project.get_display }}</del></span>
                                                     {% endif %}
                                                     ->
-                                                    <span class="success-highlight">{{ request_obj.new_project }}</span>
+                                                    <span class="success-highlight">{{ request_obj.new_project.get_display }}</span>
                                                 </li>
                                             {% endif %}
                                         {% endif %}
@@ -207,7 +218,7 @@
                     {% if request_obj.status == status_pending and user in request_obj.reviewers %}
                         <a class="btn btn-default"
                            title="Approve/Deny"
-                           href="{% url 'edit_adjustment_request' request_obj.id %}"><i class="glyphicon glyphicon-ok-circle success-highlight"></i>&nbsp;&nbsp;<i class="glyphicon glyphicon-ban-circle danger-highlight"></i> Review</a>
+                           href="{% url 'edit_adjustment_request' request_obj.id %}"><i aria-hidden="true" class="glyphicon glyphicon-ok-circle success-highlight"></i>&nbsp;&nbsp;<i aria-hidden="true" class="glyphicon glyphicon-ban-circle danger-highlight"></i> Review</a>
                     {% endif %}
                     {% if request_obj.status == status_pending and request_obj.creator == user %}
                         {% url 'edit_adjustment_request' request_obj.id as edit_request_url %}

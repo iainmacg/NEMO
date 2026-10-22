@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import time
+import warnings
 from abc import ABC
 from datetime import date, datetime
 from logging import getLogger
-from threading import Lock
+from threading import RLock
 from typing import Dict, Iterable, List, Optional
 
 from dateutil.relativedelta import relativedelta
@@ -52,11 +55,11 @@ customization_logger = getLogger(__name__)
 
 
 class CustomizationBase(ABC):
-    _instances = {}
+    _instances: Dict[str, CustomizationBase] = {}
     # Static cache variables
     _variables_cache = None
     _cache_expiry = 0
-    _cache_lock = Lock()
+    _cache_lock = RLock()
     # Cache expiry time (in seconds, default 30 seconds)
     CACHE_TTL = quiet_int(getattr(settings, "CUSTOMIZATIONS_CACHE_SECONDS", 30), 30)
 
@@ -166,52 +169,47 @@ class CustomizationBase(ABC):
         CustomizationBase._instances[inst.key] = inst
 
     @staticmethod
-    def instances() -> Iterable:
+    def instances() -> Iterable[CustomizationBase]:
         return CustomizationBase._instances.values()
 
     @staticmethod
-    def get_instance(key):
+    def get_instance(key) -> Optional[CustomizationBase]:
         return CustomizationBase._instances.get(key)
 
     @staticmethod
     def _all_variables() -> Dict:
-        all_variables = CustomizationBase.variables
+        all_variables = dict(CustomizationBase.variables)
         for instance in CustomizationBase.instances():
             all_variables.update(instance.variables)
         return all_variables
 
     @classmethod
-    def get(cls, name: str, raise_exception=True, use_cache=True) -> str:
+    def get(cls, name: str, raise_exception=True, use_cache=True) -> Optional[str]:
         if name not in cls.variables:
-            raise InvalidCustomizationException(name)
-        default_value = cls.variables[name]
-        if use_cache:
-            # We are using the cache (default behavior)
-            try:
-                CustomizationBase._load_cache()  # Ensure cache is valid
+            if name in cls._all_variables():
+                owner = next(
+                    (type(cust).__name__ for cust in CustomizationBase.instances() if name in cust.variables),
+                    None,
+                )
+                customization_logger.warning(
+                    f"Variable {name} is requested for {cls.__name__} but is defined in: {owner}"
+                )
+            else:
+                raise InvalidCustomizationException(name)
+        default_value = cls.variables.get(name, cls._all_variables().get(name))
+        try:
+            if use_cache:
                 with CustomizationBase._cache_lock:
-                    if name in CustomizationBase._variables_cache:
-                        # Return the cached value
-                        return CustomizationBase._variables_cache[name]
-                    else:
-                        # Return default value
-                        return default_value
-            except Exception:
-                if raise_exception:
-                    raise
-                else:
-                    return default_value
-        else:
-            # We are not using the cache, so we need to load the value from the database
-            try:
+                    CustomizationBase._load_cache()
+                    return CustomizationBase._variables_cache.get(name, default_value)
+            else:
                 return Customization.objects.get(name=name).value
-            except Customization.DoesNotExist:
-                return default_value
-            except Exception:
-                if raise_exception:
-                    raise
-                else:
-                    return default_value
+        except Customization.DoesNotExist:
+            return default_value
+        except Exception:
+            if raise_exception:
+                raise
+            return default_value
 
     @staticmethod
     def get_all() -> Dict:
@@ -231,13 +229,13 @@ class CustomizationBase(ABC):
         return cls.get(name, raise_exception) == "enabled"
 
     @classmethod
-    def get_date(cls, name: str, raise_exception=True) -> date:
+    def get_date(cls, name: str, raise_exception=True) -> Optional[date]:
         str_date = cls.get(name, raise_exception)
         if str_date:
             return datetime.strptime(str_date, date_input_format).date()
 
     @classmethod
-    def get_datetime(cls, name: str, raise_exception=True) -> datetime:
+    def get_datetime(cls, name: str, raise_exception=True) -> Optional[datetime]:
         str_datetime = cls.get(name, raise_exception)
         if str_datetime:
             return datetime.strptime(str_datetime, datetime_input_format)
@@ -296,6 +294,7 @@ class ApplicationCustomization(CustomizationBase):
         "safety_page_title": "Safety",
         "kiosk_message": "<h1>Scan your badge to control tools</h1>",
         "kiosk_numpad_size": "large",
+        "area_access_change_project_charged": "create_new_record",
         "kiosk_consumable_checkout": "",
         "area_access_kiosk_option_login_success": "",
         "area_access_kiosk_option_logout_warning": "",
@@ -313,10 +312,30 @@ class ApplicationCustomization(CustomizationBase):
         return errors
 
 
+@customization(key="core_facility", title="Core facilities")
+class CoreFacilityCustomization(CustomizationBase):
+    variables = {
+        "core_facility_external_id_name": "External ID",
+        "core_facility_required_for_tools": "",
+        "core_facility_required_for_areas": "",
+        "core_facility_required_for_consumables": "",
+        "core_facility_required_for_staff_charges": "",
+    }
+
+    @classmethod
+    def set(cls, name, value):
+        super().set(name, value)
+        from NEMO.admin import CoreFacilityAdmin
+
+        if name and name == "core_facility_external_id_name":
+            CoreFacilityAdmin.get_external_id.short_description = value
+
+
 @customization(key="projects_and_accounts", title="Projects & accounts")
 class ProjectsAccountsCustomization(CustomizationBase):
     variables = {
         "project_selection_template": "{{ project.name }}",
+        "project_name_template": "{{ project.name }}",
         "project_application_identifier_name": "Application identifier",
         "project_allow_document_upload": "",
         "account_list_active_only": "",
@@ -327,10 +346,11 @@ class ProjectsAccountsCustomization(CustomizationBase):
         "project_allow_transferring_charges": "",
         "project_type_allow_multiple": "",
         "account_enable_manager_edit_mode": "",
+        "project_hide_project_info": "",
     }
 
     def validate(self, name, value):
-        if name == "project_selection_template":
+        if name in ["project_selection_template", "project_name_template"]:
             try:
                 Template(value).render(Context({"project": Project()}))
             except Exception as e:
@@ -344,6 +364,7 @@ class UserCustomization(CustomizationBase):
         "default_user_is_inactive": "",
         "user_type_required": "",
         "user_list_active_only": "",
+        "user_list_on_search_view": "enabled",
         "user_access_expiration_reminder_days": "",
         "user_access_expiration_reminder_cc": "",
         "user_access_expiration_buffer_days": "",
@@ -351,6 +372,7 @@ class UserCustomization(CustomizationBase):
         "user_access_expiration_types": "-1",
         "user_access_expiration_banner_warning": "",
         "user_access_expiration_banner_danger": "",
+        "user_access_expiration_banner_message": '<div class="text-center alert alert-{{ show_access_expiration_banner }}">\n<i aria-hidden="true" class="glyphicon glyphicon-alert"></i> Your access {% if user.access_expiration < now.date %}expired {{ user.access_expiration|timesince }} ago{% else %}expires in {{ user.access_expiration|timeuntil }}{% endif %} on {{ user.access_expiration|date:"SHORT_DATE_FORMAT" }}\n</div>',
         "user_allow_document_upload": "",
         "user_allow_profile_view": "",
     }
@@ -412,26 +434,58 @@ class CalendarCustomization(CustomizationBase):
         "calendar_month_column_format": "ddd",
         "calendar_month_time_format": "h(:mm)t",
         "calendar_start_of_the_day": "07:00:00",
+        "calendar_slot_resolution_minutes": "15",
+        "calendar_slot_label_interval_minutes": "60",
         "calendar_now_indicator": "",
         "calendar_display_not_qualified_areas": "",
         "calendar_all_tools": "",
         "calendar_all_areas": "",
         "calendar_all_areastools": "",
+        "calendar_team_schedule_project_members": "",
         "calendar_outage_recurrence_limit": "90",
         "calendar_qualified_tools": "",
+        "calendar_tool_category_filter": "",
         "calendar_configuration_in_reservations": "",
         "calendar_status_bar_show_tool_reservation_policy": "enabled",
         "calendar_status_bar_show_tool_pinned_comments": "enabled",
         "calendar_status_bar_show_tool_latest_problem": "enabled",
         "calendar_status_bar_tool_max_width": "400",
+        "calendar_default_event_view": "reservations",
         "create_reservation_confirmation": "",
         "change_reservation_confirmation": "",
         "reservation_confirmation_date_format": "MMMM D, yyyy",
         "reservation_confirmation_time_format": "h:mma",
+        "calendar_color_tool_usage_default": "#33ad33",
+        "calendar_color_area_access_default": "#88b7cd",
+        "calendar_color_tool_reservation_default": "#88b7cd",
+        "calendar_color_area_reservation_default": "#88b7cd",
+        "calendar_color_tool_personal_schedule": "#33ad33",
+        "calendar_color_area_personal_schedule": "#84cd84",
+        "calendar_color_tool_missed_reservation": "#ff0000",
+        "calendar_color_area_missed_reservation": "#ff6666",
+        "calendar_color_outage": "#ff0000",
     }
+
+    def validate(self, name, value):
+        if name in ("calendar_slot_resolution_minutes", "calendar_slot_label_interval_minutes") and value:
+            validate_integer(value)
+            minutes = int(value)
+            if minutes < 1:
+                raise ValidationError("Value must be at least 1 minute.")
+            if name == "calendar_slot_resolution_minutes" and minutes > 60:
+                raise ValidationError("Value must be 60 (1h) or less.")
+            if name == "calendar_slot_resolution_minutes" and 60 % minutes != 0:
+                raise ValidationError("Value must be a divisor of 60 (1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60).")
 
     @classmethod
     def set(cls, name: str, value):
+        if name == "calendar_slot_label_interval_minutes" and value:
+            minutes = quiet_int(value, None)
+            if minutes and minutes > 0:
+                resolution = cls.get_slot_resolution_minutes()
+                # Silent normalization on write: snap to nearest multiple of current resolution.
+                minutes = max(resolution, ((minutes + resolution // 2) // resolution) * resolution)
+                value = str(minutes)
         if name == "create_reservation_confirmation" or name == "change_reservation_confirmation":
             value_changed = value != cls.get(name)
             if value_changed:
@@ -444,6 +498,39 @@ class CalendarCustomization(CustomizationBase):
                         change_reservation_confirmation_override=False
                     )
         super().set(name, value)
+
+    @classmethod
+    def get_slot_resolution_minutes(cls, default=15) -> int:
+        minutes = cls.get_int("calendar_slot_resolution_minutes", default)
+        if not minutes or minutes < 1 or minutes > 60 or 60 % minutes != 0:
+            return default
+        return minutes
+
+    @classmethod
+    def get_slot_label_interval_minutes(cls, default=60) -> int:
+        resolution = cls.get_slot_resolution_minutes()
+        minutes = cls.get_int("calendar_slot_label_interval_minutes", default)
+        if not minutes or minutes < 1:
+            minutes = default
+        if minutes < resolution:
+            minutes = resolution
+        # snap to nearest multiple of the configured resolution if bypassed on save.
+        minutes = max(resolution, ((minutes + resolution // 2) // resolution) * resolution)
+        return minutes
+
+    @classmethod
+    def get_slot_duration(cls) -> str:
+        minutes = cls.get_slot_resolution_minutes()
+        hours = minutes // 60
+        mins = minutes % 60
+        return f"{hours:02d}:{mins:02d}:00"
+
+    @classmethod
+    def get_slot_label_interval(cls) -> str:
+        minutes = cls.get_slot_label_interval_minutes()
+        hours = minutes // 60
+        mins = minutes % 60
+        return f"{hours}:{mins:02d}"
 
 
 @customization(key="dashboard", title="Status dashboard")
@@ -472,6 +559,7 @@ class InterlockCustomization(CustomizationBase):
         "allow_bypass_interlock_on_failure": "",
         "tool_interlock_failure_message": "Communication with the interlock failed",
         "door_interlock_failure_message": "Communication with the interlock failed",
+        "tool_interlock_ask_when_shutting_down_problem": "",
     }
 
 
@@ -517,6 +605,7 @@ class AdjustmentRequestsCustomization(CustomizationBase):
         "adjustment_requests_waive_area_access_enabled": "",
         "adjustment_requests_waive_consumable_withdrawal_enabled": "",
         "adjustment_requests_waive_missed_reservation_enabled": "",
+        "adjustment_requests_waive_staff_charge_enabled": "",
         "adjustment_requests_title": "Adjustment requests",
         "adjustment_requests_description": "",
         "adjustment_requests_charges_display_number": "10",
@@ -619,7 +708,10 @@ class RecurringChargesCustomization(CustomizationBase):
 
     def __init__(self, key, title):
         super().__init__(key, title)
-        self.update_title()
+        # Ignore warning when updating title during initialization
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            self.update_title()
 
     def context(self) -> Dict:
         # Override to add list of consumable categories
@@ -648,31 +740,14 @@ class ToolCustomization(CustomizationBase):
         "tool_task_updates_facility_managers": "enabled",
         "tool_task_updates_superusers": "",
         "tool_task_updates_allow_regular_user_preferences": "",
-        "tool_control_hide_data_history_users": "",
-        "tool_control_documents_in_separate_tab": "",
-        "tool_control_configuration_setting_template": "{{ current_setting }}",
-        "tool_control_broadcast_upcoming_reservation": "",
-        "tool_control_show_task_details": "",
-        "tool_control_show_qualified_users_to_all": "",
-        "tool_control_show_documents_only_qualified_users": "",
-        "tool_control_show_tool_credentials": "enabled",
-        "tool_control_show_next_reservation_user": "",
-        "tool_control_prefill_post_usage_with_pre_usage_answers": "",
-        "tool_control_use_self": "Use this tool for my own project",
-        "tool_control_use_self_training": "Use this tool for my own project for training",
-        "tool_control_use_for_other": "Use this tool on behalf of another user",
-        "tool_control_use_for_other_training": "Use this tool on behalf of another user for training",
-        "tool_control_use_for_other_remote": "Use this tool for a remote project",
-        "tool_control_note_show": "",
-        "tool_control_note_copy_reservation": "",
-        "tool_qualification_reminder_days": "",
-        "tool_qualification_expiration_days": "",
-        "tool_qualification_expiration_never_used_days": "",
-        "tool_qualification_cc": "",
+        "tool_comments_hide_for_non_staff": "",
+        "tool_problem_hide_for_non_staff": "",
         "tool_problem_max_image_size_pixels": "750",
         "tool_problem_send_to_all_qualified_users": "",
         "tool_problem_allow_regular_user_preferences": "",
         "tool_problem_safety_hazard_automatic_shutdown": "",
+        "tool_problem_title_enabled": "enabled",
+        "tool_configuration_setting_template": "{{ current_setting }}",
         "tool_configuration_near_future_days": "1",
         "tool_configuration_change_while_in_use": "",
         "tool_reservation_policy_superusers_bypass": "",
@@ -689,25 +764,53 @@ class ToolCustomization(CustomizationBase):
         if (
             name
             in [
-                "tool_qualification_expiration_days",
                 "tool_problem_max_image_size_pixels",
                 "tool_configuration_near_future_days",
             ]
             and value
         ):
             validate_integer(value)
-        if name == "tool_qualification_reminder_days" and value:
-            # Check that we have an integer or a list of integers
-            validate_comma_separated_integer_list(value)
-        elif name == "tool_qualification_cc":
-            recipients = tuple([e for e in value.split(",") if e])
-            for email in recipients:
-                validate_email(email)
-        if name == "tool_control_configuration_setting_template" and value:
+        if name == "tool_configuration_setting_template" and value:
             try:
                 Template(value).render(Context({"current_setting": "setting"}))
             except Exception as e:
                 raise ValidationError(str(e))
+
+
+@customization(key="tool_control", title="Tool control")
+class ToolControlCustomization(CustomizationBase):
+    variables = {
+        "tool_control_hide_data_history_users": "",
+        "tool_control_documents_in_separate_tab": "",
+        "tool_control_broadcast_upcoming_reservation": "",
+        "tool_control_show_task_details": "",
+        "tool_control_show_qualified_users_to_all": "",
+        "tool_control_show_documents_only_qualified_users": "",
+        "tool_control_show_tool_credentials": "enabled",
+        "tool_control_show_next_reservation_user": "",
+        "tool_control_prefill_post_usage_with_pre_usage_answers": "",
+        "tool_control_prefill_pre_usage_with_reservation_answers": "",
+        "tool_control_use_self_label": "Use this tool for my own project",
+        "tool_control_use_for_other_enabled": "",
+        "tool_control_use_for_other_label": "Use this tool on behalf of another user",
+        "tool_control_use_for_other_staff_charge_enabled": "",
+        "tool_control_use_for_other_staff_charge_label": "Use this tool on behalf of another user - charge staff time",
+        "tool_control_use_for_other_area_access_automatically_enabled": "enabled",
+        "tool_control_use_for_other_area_access_automatically_label": "and {{ tool.requires_area_access|lower }} time",
+        "tool_control_use_for_other_remote_enabled": "enabled",
+        "tool_control_use_for_other_remote_label": "Use this tool for a remote project",
+        "tool_control_use_for_other_remote_staff_charge_enabled": "enabled",
+        "tool_control_use_for_other_remote_staff_charge_label": "Use this tool for a remote project - charge staff time",
+        "tool_control_use_for_other_remote_area_access_automatically_enabled": "enabled",
+        "tool_control_use_for_other_remote_area_access_automatically_label": "and {{ tool.requires_area_access|lower }} time",
+        "tool_control_use_self_training_enabled": "",
+        "tool_control_use_self_training_label": "Use this tool for my own project for training",
+        "tool_control_use_for_other_training_enabled": "",
+        "tool_control_use_for_other_training_label": "Use this tool on behalf of another user for training",
+        "tool_control_note_show": "",
+        "tool_control_note_copy_reservation": "",
+        "tool_control_hide_tool_owners": "",
+    }
 
 
 @customization(key="safety", title="Safety")
@@ -734,8 +837,6 @@ class KnowledgeBaseCustomization(CustomizationBase):
 class RemoteWorkCustomization(CustomizationBase):
     variables = {
         "remote_work_validation": "",
-        "remote_work_start_area_access_automatically": "enabled",
-        "remote_work_on_behalf_of_user": "always",
     }
 
 
@@ -745,8 +846,6 @@ class TrainingCustomization(CustomizationBase):
         "training_only_type": "",
         "training_allow_date": "",
         "training_included_hidden_tools": "",
-        "training_show_self_option_in_tool_control": "",
-        "training_show_behalf_option_in_tool_control": "",
     }
 
     def context(self) -> Dict:
@@ -778,6 +877,7 @@ class TrainingCustomization(CustomizationBase):
 
 @customization(key="templates", title="File & email templates")
 class TemplatesCustomization(CustomizationBase):
+    variables = {}
     files = [
         ("login_banner", ".html"),
         ("authorization_failed", ".html"),
@@ -886,7 +986,7 @@ def set_customization(name, value):
 @administrator_required
 @require_GET
 def customization(request, key: str = "application"):
-    customization_instance: CustomizationBase = CustomizationBase.get_instance(key)
+    customization_instance: Optional[CustomizationBase] = CustomizationBase.get_instance(key)
     if not customization_instance:
         return HttpResponseNotFound(f"Customizations with key: '{key}' not found")
     return render(request, "customizations/customizations.html", customization_instance.context())
@@ -895,7 +995,7 @@ def customization(request, key: str = "application"):
 @administrator_required
 @require_POST
 def customize(request, key, element=None):
-    customization_instance: CustomizationBase = CustomizationBase.get_instance(key)
+    customization_instance: Optional[CustomizationBase] = CustomizationBase.get_instance(key)
     if not customization_instance:
         return HttpResponseNotFound(f"Customizations with key: '{key}' not found")
     errors = customization_instance.save(request, element)

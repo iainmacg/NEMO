@@ -31,10 +31,13 @@ class CalendarDisplayMixin:
     end = None
 
     def get_visual_end(self):
+        from NEMO.views.customization import CalendarCustomization
+
+        min_minutes = CalendarCustomization.get_slot_resolution_minutes()
         if self.end is None:
-            return max(self.start + timedelta(minutes=15), timezone.now())
+            return max(self.start + timedelta(minutes=min_minutes), timezone.now())
         else:
-            return max(self.start + timedelta(minutes=15), self.end)
+            return max(self.start + timedelta(minutes=min_minutes), self.end)
 
 
 class BillableItemMixin:
@@ -214,7 +217,7 @@ class BillableItemMixin:
 
     def can_be_waived(self):
         from NEMO.views.customization import AdjustmentRequestsCustomization
-        from NEMO.models import AreaAccessRecord, ConsumableWithdraw, Reservation, UsageEvent
+        from NEMO.models import AreaAccessRecord, ConsumableWithdraw, Reservation, UsageEvent, StaffCharge
 
         return (
             isinstance(self, AreaAccessRecord)
@@ -225,6 +228,8 @@ class BillableItemMixin:
             and AdjustmentRequestsCustomization.get_bool("adjustment_requests_waive_consumable_withdrawal_enabled")
             or isinstance(self, Reservation)
             and AdjustmentRequestsCustomization.get_bool("adjustment_requests_waive_missed_reservation_enabled")
+            or isinstance(self, StaffCharge)
+            and AdjustmentRequestsCustomization.get_bool("adjustment_requests_waive_staff_charge_enabled")
         )
 
     def can_times_be_changed(item):
@@ -298,7 +303,7 @@ class BillableItemMixin:
             return self.get_real_type()
 
     def get_display(self, user: User = None) -> str:
-        project_display = f", charged to {self.project}"
+        project_display = f", charged to {self.project.get_display() if self.project else None}"
         customer_display = f" for {self.get_customer()}"
         operator_display = f" {self.get_operator_action()}by {self.get_operator()}"
         user_display = ""

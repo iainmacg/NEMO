@@ -151,7 +151,7 @@
         {# When an AJAX request receives an HTTP 403 (unauthorized) reply the user is #}
         {# sent to the logoff page, which then redirects them back to the login page. #}
         {% if logout_allowed %}
-            $(document).ajaxComplete(function (event, xhr, status, error){navigate_to_login_on_session_expiration('{% url 'logout' %}', event, xhr, status, error)});
+            $(document).ajaxComplete(function (event, xhr, status, error){navigate_to_login_on_session_expiration(event, xhr, status, error)});
         {% endif %}
 
         {# Remove all size classes from the modal on close, to revert to default medium size #}
@@ -165,9 +165,12 @@
     }, false);
 
     {# Hide spinner on page unload, just in case for some browser back button reloading it #}
-    window.addEventListener('unload', function()
+    window.addEventListener('pageshow', function(event)
     {
-        hide_spinner();
+        if (event.persisted)
+        {
+            hide_spinner();
+        }
     });
         </script>
     </body>

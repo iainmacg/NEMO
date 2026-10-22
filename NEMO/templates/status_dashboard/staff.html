@@ -68,7 +68,7 @@
                             <a style="cursor: pointer"
                                onclick="refresh_staff_status_dashboard('timestamp={{ prev }}&view={{ page_view }}');"
                                aria-label="Previous page button">
-                                <i class="glyphicon glyphicon-chevron-left chevron" style="padding: 0"></i>
+                                <i aria-hidden="true" class="glyphicon glyphicon-chevron-left chevron" style="padding: 0"></i>
                             </a>
                         </th>
                     {% endif %}
@@ -83,7 +83,7 @@
                             <a style="cursor: pointer"
                                onclick="refresh_staff_status_dashboard('timestamp={{ next }}&view={{ page_view }}')"
                                aria-label="Next page button">
-                                <i class="glyphicon glyphicon-chevron-right chevron" style="padding: 0"></i>
+                                <i aria-hidden="true" class="glyphicon glyphicon-chevron-right chevron" style="padding: 0"></i>
                             </a>
                         </th>
                     {% endif %}
@@ -126,7 +126,7 @@
                                                 </div>
                                             {% endwith %}
                                         {% elif staff_absent %}
-                                            {% if not user.is_facility_manager %}
+                                            {% if not perms.NEMO.view_staffabsence %}
                                                 {% if customizations|get_item:"dashboard_staff_status_absence_view_staff" == "enabled" and user.is_staff or customizations|get_item:"dashboard_staff_status_absence_view_user_office" == "enabled" and user.is_user_office or customizations|get_item:"dashboard_staff_status_absence_view_accounting_officer" == "enabled" and user.is_accounting_officer %}
                                                     <div data-toggle="tooltip" title="{{ staff_absent.details_for_manager }}">
                                                         <span>{{ staff_absent.absence_type.name }}</span>

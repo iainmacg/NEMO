@@ -35,6 +35,7 @@ from NEMO.models import (
     Consumable,
     ConsumableCategory,
     ConsumableWithdraw,
+    CoreFacility,
     Customization,
     Interlock,
     InterlockCard,
@@ -49,6 +50,7 @@ from NEMO.models import (
     Reservation,
     ReservationQuestions,
     Resource,
+    ResourceCategory,
     ScheduledOutage,
     StaffAssistanceRequest,
     StaffCharge,
@@ -57,14 +59,17 @@ from NEMO.models import (
     TemporaryPhysicalAccessRequest,
     Tool,
     ToolCredentials,
+    ToolQualificationGroup,
     ToolUsageCounter,
     ToolUsageQuestions,
     TrainingSession,
+    UnplannedOutage,
     UsageEvent,
     User,
     UserCalendarToolList,
     UserDocuments,
     UserPreferences,
+    UserType,
 )
 
 
@@ -162,6 +167,18 @@ class AlertSerializer(FlexFieldsSerializerMixin, ModelSerializer):
         }
 
 
+class CoreFacilitySerializer(ModelSerializer):
+    class Meta:
+        model = CoreFacility
+        fields = "__all__"
+
+
+class UserTypeSerializer(ModelSerializer):
+    class Meta:
+        model = UserType
+        fields = "__all__"
+
+
 class UserSerializer(FlexFieldsSerializerMixin, ModelSerializer):
     user_documents = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
 
@@ -176,6 +193,7 @@ class UserSerializer(FlexFieldsSerializerMixin, ModelSerializer):
             "groups": ("NEMO.serializers.GroupSerializer", {"many": True}),
             "user_documents": ("NEMO.serializers.UserDocumentSerializer", {"many": True}),
             "user_permissions": ("NEMO.serializers.PermissionSerializer", {"many": True}),
+            "type": ("NEMO.serializers.UserTypeSerializer",),
         }
 
     def to_internal_value(self, data):
@@ -276,6 +294,16 @@ class QualificationSerializer(FlexFieldsSerializerMixin, ModelSerializer):
         }
 
 
+class ToolQualificationGroupSerializer(FlexFieldsSerializerMixin, ModelSerializer):
+    class Meta:
+        model = ToolQualificationGroup
+        fields = "__all__"
+        expandable_fields = {
+            "tools": ("NEMO.serializers.ToolSerializer", {"many": True}),
+            "training_charge_tool": ("NEMO.serializers.ToolSerializer",),
+        }
+
+
 class ToolSerializer(FlexFieldsSerializerMixin, ModelSerializer):
     class Meta:
         model = Tool
@@ -287,6 +315,7 @@ class ToolSerializer(FlexFieldsSerializerMixin, ModelSerializer):
             "_superusers": ("NEMO.serializers.UserSerializer", {"many": True}),
             "_requires_area_access": "NEMO.serializers.AreaSerializer",
             "project": "NEMO.serializers.ProjectSerializer",
+            "core_facility": "NEMO.serializers.CoreFacilitySerializer",
         }
 
 
@@ -294,7 +323,10 @@ class AreaSerializer(FlexFieldsSerializerMixin, ModelSerializer):
     class Meta:
         model = Area
         fields = "__all__"
-        expandable_fields = {"parent_area": "NEMO.serializers.AreaSerializer"}
+        expandable_fields = {
+            "parent_area": "NEMO.serializers.AreaSerializer",
+            "core_facility": "NEMO.serializers.CoreFacilitySerializer",
+        }
 
 
 class ConfigurationOptionSerializer(FlexFieldsSerializerMixin, ModelSerializer):
@@ -409,6 +441,16 @@ class ScheduledOutageSerializer(FlexFieldsSerializerMixin, ModelSerializer):
         }
 
 
+class UnplannedOutageSerializer(FlexFieldsSerializerMixin, ModelSerializer):
+    class Meta:
+        model = UnplannedOutage
+        fields = "__all__"
+        expandable_fields = {
+            "tool": "NEMO.serializers.ToolSerializer",
+            "resource": "NEMO.serializers.ResourceSerializer",
+        }
+
+
 class TrainingSessionSerializer(FlexFieldsSerializerMixin, ModelSerializer):
     class Meta:
         model = TrainingSession
@@ -433,7 +475,14 @@ class StaffChargeSerializer(FlexFieldsSerializerMixin, ModelSerializer):
             "project": "NEMO.serializers.ProjectSerializer",
             "validated_by": "NEMO.serializers.UserSerializer",
             "waived_by": "NEMO.serializers.UserSerializer",
+            "core_facility": "NEMO.serializers.CoreFacilitySerializer",
         }
+
+
+class ResourceCategorySerializer(ModelSerializer):
+    class Meta:
+        model = ResourceCategory
+        fields = "__all__"
 
 
 class ResourceSerializer(FlexFieldsSerializerMixin, ModelSerializer):
@@ -441,6 +490,7 @@ class ResourceSerializer(FlexFieldsSerializerMixin, ModelSerializer):
         model = Resource
         fields = "__all__"
         expandable_fields = {
+            "category": "NEMO.serializers.ResourceCategorySerializer",
             "fully_dependent_tools": ("NEMO.serializers.ToolSerializer", {"many": True}),
             "partially_dependent_tools": ("NEMO.serializers.ToolSerializer", {"many": True}),
             "dependent_areas": ("NEMO.serializers.AreaSerializer", {"many": True}),
@@ -459,6 +509,7 @@ class ConsumableSerializer(FlexFieldsSerializerMixin, ModelSerializer):
         fields = "__all__"
         expandable_fields = {
             "category": "NEMO.serializers.ConsumableCategorySerializer",
+            "core_facility": "NEMO.serializers.CoreFacilitySerializer",
         }
 
 
@@ -673,12 +724,14 @@ class BillableItemSerializer(serializers.Serializer):
     project = CharField(max_length=CHAR_FIELD_MEDIUM_LENGTH, read_only=True)
     project_id = IntegerField(read_only=True)
     application = CharField(max_length=CHAR_FIELD_MEDIUM_LENGTH, read_only=True)
+    core_facility = CharField(max_length=CHAR_FIELD_MEDIUM_LENGTH, read_only=True)
+    core_facility_id = IntegerField(read_only=True)
     user = CharField(max_length=CHAR_FIELD_MEDIUM_LENGTH, read_only=True)
     username = CharField(max_length=CHAR_FIELD_MEDIUM_LENGTH, read_only=True)
     user_id = IntegerField(read_only=True)
     start = DateTimeField(read_only=True)
     end = DateTimeField(read_only=True)
-    quantity = DecimalField(read_only=True, decimal_places=2, max_digits=8)
+    quantity = DecimalField(read_only=True, decimal_places=2, max_digits=14)
     validated = BooleanField(read_only=True)
     validated_by = CharField(read_only=True, source="validated_by.username", allow_null=True)
     waived = BooleanField(read_only=True)
@@ -702,7 +755,9 @@ class ToolStatusSerializer(serializers.Serializer):
     in_use = BooleanField(read_only=True)
     visible = BooleanField(read_only=True)
     operational = BooleanField(read_only=True)
+    non_operational_since = DateTimeField(default=None, read_only=True)
     problematic = BooleanField(read_only=True)
+    problematic_since = DateTimeField(default=None, read_only=True)
     problem_descriptions = CharField(default=None, max_length=CHAR_FIELD_LARGE_LENGTH, read_only=True)
     customer_id = IntegerField(default=None, source="get_current_usage_event.user.id", read_only=True)
     customer_name = CharField(
@@ -733,9 +788,13 @@ class ToolStatusSerializer(serializers.Serializer):
     current_usage_id = IntegerField(default=None, source="get_current_usage_event.id", read_only=True)
     current_usage_start = DateTimeField(default=None, source="get_current_usage_event.start", read_only=True)
     outages = CharField(default=None, max_length=2000, read_only=True)
+    outages_since = DateTimeField(default=None, read_only=True)
     partial_outages = CharField(default=None, max_length=2000, read_only=True)
+    partial_outages_since = DateTimeField(default=None, read_only=True)
     required_resources_unavailable = CharField(default=None, max_length=2000, read_only=True)
+    required_resources_unavailable_since = DateTimeField(default=None, read_only=True)
     optional_resources_unavailable = CharField(default=None, max_length=2000, read_only=True)
+    optional_resources_unavailable_since = DateTimeField(default=None, read_only=True)
 
     def update(self, instance, validated_data):
         pass

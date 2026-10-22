@@ -5,13 +5,27 @@
     {% load static %}
     <link rel="stylesheet" type="text/css" href="{% static "fullcalendar/fullcalendar.min.css" %}" />
     <script type="text/javascript" src="{% static "fullcalendar/fullcalendar.min.js" %}"></script>
+    {# Select2 (used by the tool category filter) #}
+    <script type="text/javascript" src="{% static "select2/js/select2.min.js" %}"></script>
+    <link rel="stylesheet" type="text/css" href="{% static "select2/css/select2.min.css" %}" />
+    <link rel="stylesheet" type="text/css" href="{% static "select2/css/select2-bootstrap.min.css" %}" />
 {% endblock %}
 {% block body %}
     <div id="main-content">
         <div id="sidebar" class="application-sidebar">
             <div class="btn-group sidebar-item">
                 <button type="button" class="btn btn-default dropdown-toggle" style="width:100%" data-toggle="dropdown">
-                    <span id="event_type">Reservations</span>
+                    <span id="event_type">
+                        {% if customizations|get_item:"calendar_default_event_view" == "reservations_and_usage" %}
+                            Reservations and use
+                        {% elif customizations|get_item:"calendar_default_event_view" == "usage" %}
+                            {{ facility_name }} use
+                        {% elif customizations|get_item:"calendar_default_event_view" == "configuration_agenda" %}
+                            Configuration agenda
+                        {% else %}
+                            Reservations
+                        {% endif %}
+                    </span>
                     <span class="caret"></span>
                 </button>
                 <ul class="dropdown-menu">
@@ -119,6 +133,15 @@
                        onclick="set_selected_item(this, true)"
                        style="width: 100%">Personal schedule</a>
                 </li>
+                {% if team_schedule %}
+                    <li>
+                        <a href="javascript:void(0)"
+                           id="extra-links-team-schedule"
+                           class="team_schedule"
+                           data-item-id="team_schedule"
+                           onclick="on_extra_link_click(this)">Team schedule</a>
+                    </li>
+                {% endif %}
                 {% if calendar_all_tools %}
                     <li>
                         <a href="javascript:void(0)"
@@ -199,6 +222,10 @@ function update_event_sources()
 		if(item === 'personal_schedule' && !has_checked_items)
 		{
             add_item_to_event_feed_list(item_event_source_list, url, event_type, { personal_schedule: true });
+		}
+		else if(item === 'team_schedule')
+		{
+            add_item_to_event_feed_list(item_event_source_list, url, event_type, { team_schedule: true });
 		}
 		else if(item === 'all_tools')
 		{
@@ -375,14 +402,16 @@ function create(start, end, jsEvent, view)
 	let item = $(".selected");
 	{# Only allow reservations to be created when a item has been selected. #}
 	let item_selected = (item != null);
-	{# Only allow selection to proceed when we're in reservation view (instead of use view). #}
-	let reservation_view = get_event_type() === 'reservations';
+	{# Only allow selection to proceed when we're in one of the reservation views (instead of use view). #}
+	let reservation_view = get_event_type() === 'reservations' || get_event_type() === 'reservations and use';
 	{# Users may not create reservations when viewing their personal schedule. #}
 	let personal_schedule = item.hasClass('personal_schedule');
 	let all_tools = item.hasClass('all_tools');
 	let all_areas = item.hasClass('all_areas');
 	let all_areastools = item.hasClass('all_areastools');
-	if(!item_selected || !reservation_view || personal_schedule || all_tools || all_areas || all_areastools)
+	let team_schedule = item.hasClass('team_schedule');
+	let user_list = item.parent().hasClass('user-tool-list');
+	if(!item_selected || !reservation_view || personal_schedule || all_tools || all_areas || all_areastools || team_schedule || user_list)
 	{
 		$("#calendar").fullCalendar("unselect");
 		return;
@@ -635,8 +664,8 @@ function create_calendar()
         "slotLabelFormat": '{{ calendar_axis_time_format }}',
 		"allDaySlot": false,
 		"allDayDefault": false,
-		"slotDuration": '00:15:00', {# 15 minutes each row #}
-		"slotLabelInterval": '1:00', {# One hour intervals for label #}
+		"slotDuration": '{{ calendar_slot_duration }}', {# Configured minutes each row #}
+		"slotLabelInterval": '{{ calendar_slot_label_interval }}', {# Configured label spacing #}
 		"editable": false,
 		"selectable": true,
 		"selectHelper": true,
@@ -820,7 +849,7 @@ function change_calendar_event_type(calling_element)
     let item_tree_tools = $("#item-tree-tool");
     let item_tree_areas = $("#item-tree-area");
 	let event_type = get_event_type();
-    let extra_links_personal_schedule = $("#extra-links-personal-schedule, #checkbox-personal-schedule-personal-schedule");
+    let extra_links_personal_schedule = $("#extra-links-personal-schedule, #checkbox-personal-schedule-personal-schedule, #extra-links-team-schedule");
     let extra_links_all_tools = $("#extra-links-all-tools");
     let extra_links_all_areas = $("#extra-links-all-areas");
     let extra_links_all_areastools = $("#extra-links-all-areastools");
@@ -1147,6 +1176,9 @@ function on_load()
     {% if user.is_staff or customizations|get_item:"calendar_qualified_tools" == "enabled" %}
         {# Filter "my tools" depending on the status of the button. #}
         load_my_tools(retrieve_my_tools());
+    {% endif %}
+    {% if customizations|get_item:"calendar_tool_category_filter" == "enabled" %}
+        setup_tool_category_filter();
     {% endif %}
 	$('input[type=checkbox].item-checkbox').show();
 	$(".item_tree").show(); {# Item tree is initially hidden so that previous expand/collapse state of categories is configured before it's visible. #}

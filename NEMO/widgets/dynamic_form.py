@@ -406,7 +406,7 @@ class PostUsageFloatFieldQuestion(PostUsageTextFieldQuestion):
 
     def render_input(self, readonly: str, required: str, pattern: str, placeholder: str, default_value: str) -> str:
         precision = self.precision if self.precision else 2
-        pattern = f'pattern="^\s*(?=.*[0-9])\d*(?:\.\d{"{1," + str(precision) + "}"})?\s*$"'
+        pattern = rf'pattern="^\s*(?=.*[0-9])\d*(?:\.\d{"{1," + str(precision) + "}"})?\s*$"'
         return f'<input type="text" class="form-control" id="{self.form_name}" name="{self.form_name}" {placeholder} {pattern} {default_value} {required} {readonly} spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off">'
 
     def render_script(self, virtual_inputs: bool, item, dynamic_field_name: str) -> str:
@@ -597,16 +597,17 @@ class PostUsageGroupQuestion(PostUsageQuestion):
             result += self.render_group_question(virtual_inputs, item, dynamic_field_name)
             result += "</div>"
         result += "</div>"
-        result += '<div class="form-group">'
-        add_group_url = (
-            reverse(
-                "render_group_question",
-                args=[ContentType.objects.get_for_model(item).id, item.id, dynamic_field_name, self.group_name],
+        if self.max_number > 1:
+            result += '<div class="form-group">'
+            add_group_url = (
+                reverse(
+                    "render_group_question",
+                    args=[ContentType.objects.get_for_model(item).id, item.id, dynamic_field_name, self.group_name],
+                )
+                + f"?virtual_inputs={virtual_inputs}"
             )
-            + f"?virtual_inputs={virtual_inputs}"
-        )
-        result += f'<button class="{self.group_name}_add_button" type="button" onclick="add_group_question(this, \'{self.group_name}\', {self.max_number}, \'{add_group_url}\')">{self.group_add_button_name}</button>'
-        result += "</div>"
+            result += f'<button class="{self.group_name}_add_button" type="button" onclick="add_group_question(this, \'{self.group_name}\', {self.max_number}, \'{add_group_url}\')">{self.group_add_button_name}</button>'
+            result += "</div>"
         result += "</div>"
         return result
 
@@ -842,8 +843,8 @@ class DynamicForm:
         pre_post = "post"
         if run_data_json:
             if usage_event.pre_run_data and usage_event.run_data:
-                # if we have both check which one matches
-                if loads(usage_event.pre_run_data) == run_data_json:
+                # if we have both check if the usage event has an end date
+                if not usage_event.end:
                     pre_post = "pre"
             elif usage_event.pre_run_data:
                 # if we only have pre_run_data then it has to be pre usage question
@@ -1101,7 +1102,7 @@ def sort_question_for_grid(questions: List[PostUsageQuestion]) -> List[List[Post
 
 def match_group_index(form_name: str) -> Optional[re.Pattern]:
     # This will match form_name or any combination of form_name_1, form_name_2 etc.
-    return re.compile("^" + form_name + "(_(\d+))?$")
+    return re.compile("^" + form_name + r"(_(\d+))?$")
 
 
 def get_js_event_data(item, dynamic_field_name: str, extra_data=None) -> str:
@@ -1112,6 +1113,7 @@ def get_js_event_data(item, dynamic_field_name: str, extra_data=None) -> str:
             "item_type_id": ContentType.objects.get_for_model(item).id,
             "item_id": item.id,
             "field_name": dynamic_field_name,
+            "questions_type": getattr(item, "questions_type", None),
             **extra_data,
         }
     )
@@ -1163,9 +1165,93 @@ def formula_preview(request, content_type_id, item_id, field_name, formula_name)
             data = loads(e.run_data)
         input_data = find_input_value_for_field(data, formula_name)
         return HttpResponse(input_data if input_data is not None else "")
+    except ValueError:
+        # These are usually partial or non-numeric input while the user is typing, no need to log as exception
+        dynamic_form_logger.debug("Error getting formula preview", exc_info=True)
     except:
         dynamic_form_logger.exception("Error getting formula preview")
     return HttpResponse()
+
+
+class PostUsageRatingQuestion(PostUsageQuestion):
+    question_type = "Question of type rating"
+    DEFAULT_MAX_RATING = 5
+    DEFAULT_SYMBOL = "★"
+    DEFAULT_COLOR = "#f0ad4e"
+    DEFAULT_EMPTY_COLOR = "#ccc"
+
+    def __init__(self, properties: Dict, index: int = None, initial_data=None):
+        super().__init__(properties, index, initial_data)
+        self.max_rating = int(self._init_property("max_rating") or self.DEFAULT_MAX_RATING)
+        self.symbol = self._init_property("symbol") or self.DEFAULT_SYMBOL
+        self.color = self._init_property("color") or self.DEFAULT_COLOR
+        self.empty_color = self._init_property("empty_color") or self.DEFAULT_EMPTY_COLOR
+
+    def validate(self):
+        super().validate()
+        if self.max_rating < 1:
+            raise Exception("Rating question 'max_rating' must be at least 1")
+
+    def render_element(self, virtual_inputs: bool, item, dynamic_field_name: str, extra_class="") -> str:
+        title = self.title_html or self.title
+        max_width = f"max-width:{self.max_width}px" if self.max_width else ""
+        default_value = self.get_default_value()
+        required = "required" if self.required else ""
+        initial_value = int(default_value) if default_value is not None else 0
+        result = f'<div class="form-group {extra_class}" style="{max_width}">'
+        result += f'<label style="white-space: pre-wrap">{title}{self.required_span if self.required else ""}</label>'
+        # Invisible number input for form submission and HTML5 required validation
+        result += (
+            f'<input aria-label="rating value" type="number" id="{self.form_name}" name="{self.form_name}" '
+            f'min="1" max="{self.max_rating}" style="opacity:0;height:1px;width:1px;" {required} '
+            f'tabindex="-1" value="{default_value or ""}">'
+        )
+        result += f'<div class="dynamic-form-rating" id="{self.form_name}_stars" style="font-size:1.5em;line-height:1.5;cursor:pointer;">'
+        for i in range(1, self.max_rating + 1):
+            color = self.color if i <= initial_value else self.empty_color
+            result += f'<span class="dynamic-form-rating-star" data-value="{i}" style="color:{color};padding:2px;">{self.symbol}</span>'
+        result += "</div>"
+        if self.help:
+            result += f'<div style="font-size:smaller;color:#999;">{self.help}</div>'
+        result += "</div>"
+        return result
+
+    def render_script(self, virtual_inputs: bool, item, dynamic_field_name: str) -> str:
+        default_value = self.get_default_value()
+        initial_value = int(default_value) if default_value is not None else 0
+        return f"""<script>(function() {{
+    var stars = $('#{self.form_name}_stars .dynamic-form-rating-star');
+    var input = $('#{self.form_name}');
+    var currentRating = {initial_value};
+    var filledColor = '{self.color}';
+    var emptyColor = '{self.empty_color}';
+
+    function applyRating(value) {{
+        currentRating = value;
+        input.val(value > 0 ? value : '').trigger('change');
+        stars.each(function() {{
+            $(this).css('color', parseInt($(this).data('value')) <= value ? filledColor : emptyColor);
+        }});
+    }}
+
+    stars.on('click', function() {{
+        var value = parseInt($(this).data('value'));
+        applyRating(value === currentRating ? 0 : value);
+    }});
+
+    stars.on('mouseenter', function() {{
+        var hoverVal = parseInt($(this).data('value'));
+        stars.each(function() {{
+            $(this).css('color', parseInt($(this).data('value')) <= hoverVal ? filledColor : emptyColor);
+        }});
+    }});
+
+    $('#{self.form_name}_stars').on('mouseleave', function() {{
+        stars.each(function() {{
+            $(this).css('color', parseInt($(this).data('value')) <= currentRating ? filledColor : emptyColor);
+        }});
+    }});
+}})();</script>"""
 
 
 question_types: Dict[str, Type[PostUsageQuestion]] = {
@@ -1179,4 +1265,5 @@ question_types: Dict[str, Type[PostUsageQuestion]] = {
     "dropdown": PostUsageDropdownQuestion,
     "formula": PostUsageFormulaQuestion,
     "group": PostUsageGroupQuestion,
+    "rating": PostUsageRatingQuestion,
 }
