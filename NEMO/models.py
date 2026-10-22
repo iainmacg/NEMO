@@ -10,7 +10,7 @@ from html import escape
 from json import loads
 from logging import getLogger
 from re import match
-from typing import Dict, List, Optional, Set, TYPE_CHECKING, Union
+from typing import Dict, List, Optional, Set, TYPE_CHECKING, Tuple, Union
 
 from django.conf import settings
 from django.contrib.auth.models import BaseUserManager, Group, Permission, PermissionsMixin
@@ -2566,6 +2566,24 @@ class Qualification(BaseModel):
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     tool = models.ForeignKey(Tool, on_delete=models.CASCADE)
     qualified_on = models.DateField(default=datetime.date.today)
+
+    def get_last_use_and_expiration_date(self) -> Tuple[Optional[datetime.date], Optional[datetime.date]]:
+        # Returns the last tool use and the expiration date of this qualification (None if it doesn't expire)
+        tool = self.tool
+        last_tool_use, expiration_date = None, None
+        try:
+            # Last tool use cannot be before the last time they qualified
+            last_tool_use = max(
+                as_timezone(UsageEvent.objects.filter(user=self.user, tool=tool).latest("start").start).date(),
+                self.qualified_on,
+            )
+            if tool.qualification_expiration_days:
+                expiration_date = last_tool_use + timedelta(days=tool.qualification_expiration_days)
+        except UsageEvent.DoesNotExist:
+            # User never used the tool, use the qualification date
+            if tool.qualification_expiration_never_used_days:
+                expiration_date = self.qualified_on + timedelta(days=tool.qualification_expiration_never_used_days)
+        return last_tool_use, expiration_date
 
     class Meta:
         # For db consistency and compatibility with previous queries

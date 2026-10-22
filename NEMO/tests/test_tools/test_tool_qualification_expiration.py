@@ -355,3 +355,24 @@ class ToolQualificationTestCase(NEMOTestCaseMixin, TestCase):
         self.assertTrue(
             EmailLog.objects.filter(sender="user_office@example.com", to__contains=self.user.email).exists()
         )
+
+    def test_qualification_last_use_and_expiration_date(self, mock_open, mock_exist):
+        qualification_date = date.today() - timedelta(days=10)
+        qualification = Qualification.objects.create(tool=self.tool, user=self.user, qualified_on=qualification_date)
+        # No expiration policy
+        self.assertEqual(qualification.get_last_use_and_expiration_date(), (None, None))
+        # Never used: based on qualification date
+        self.tool.qualification_expiration_days = 30
+        self.tool.qualification_expiration_never_used_days = 20
+        self.tool.save()
+        qualification.refresh_from_db()
+        self.assertEqual(
+            qualification.get_last_use_and_expiration_date(), (None, qualification_date + timedelta(days=20))
+        )
+        # Used: based on last use
+        usage_start = timezone.now() - timedelta(days=2)
+        UsageEvent.objects.create(
+            user=self.user, operator=self.user, tool=self.tool, project=self.project, start=usage_start
+        )
+        last_use = timezone.localtime(usage_start).date()
+        self.assertEqual(qualification.get_last_use_and_expiration_date(), (last_use, last_use + timedelta(days=30)))

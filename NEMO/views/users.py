@@ -452,8 +452,19 @@ def get_profile_dictionary(user_id) -> dict:
     if not user:
         raise Http404("No user matches the given query")
 
+    tool_qualifications = []
+    for qualification in user.qualification_set.select_related("tool").order_by("tool__name"):
+        last_tool_use, expiration_date = qualification.get_last_use_and_expiration_date()
+        # Staff and staff on tools are exempt from qualification expiration
+        if user.is_staff_on_tool(qualification.tool):
+            expiration_date = None
+        tool_qualifications.append(
+            {"qualification": qualification, "last_tool_use": last_tool_use, "expiration_date": expiration_date}
+        )
+
     return {
         "user_profile": user,
+        "tool_qualifications": tool_qualifications,
         "safety_trainings": SafetyTraining.objects.all(),
         "onboarding_phases": OnboardingPhase.objects.all(),
         "projects": Project.objects.filter(active=True, account__active=True),

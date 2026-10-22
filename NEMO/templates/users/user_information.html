@@ -113,9 +113,19 @@
         <div class="panel panel-default" id="user-tool-qualifications-panel">
             <div class="panel-body">
                 <h3 style="margin-top: 0">Tool Qualifications</h3>
-                {% if user_profile.qualifications.exists %}
+                {% if tool_qualifications %}
                     <ul>
-                        {% for tool_qualification in user_profile.qualifications.all %}<li>{{ tool_qualification }}</li>{% endfor %}
+                        {% for tool_qualification in tool_qualifications %}
+                            <li>
+                                {{ tool_qualification.qualification.tool }}
+                                {% if tool_qualification.expiration_date %}
+                                    <span class="text-muted">
+                                        - expires on {{ tool_qualification.expiration_date|date:"SHORT_DATE_FORMAT" }}
+                                        (last used: {{ tool_qualification.last_tool_use|date:"SHORT_DATE_FORMAT"|default:"never" }})
+                                    </span>
+                                {% endif %}
+                            </li>
+                        {% endfor %}
                     </ul>
                 {% else %}
                     <ul>
