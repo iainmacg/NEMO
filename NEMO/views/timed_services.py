@@ -832,10 +832,16 @@ def manage_tool_qualifications(request):
     return do_manage_tool_qualifications(request)
 
 
+def tool_qualification_expiration_enabled() -> bool:
+    # Tool qualifications only expire when the user office email and the expiration email template are set
+    return bool(
+        EmailsCustomization.get("user_office_email_address")
+        and get_media_file_contents("tool_qualification_expiration_email.html")
+    )
+
+
 def do_manage_tool_qualifications(request=None):
-    user_office_email = EmailsCustomization.get("user_office_email_address")
-    template = get_media_file_contents("tool_qualification_expiration_email.html")
-    if user_office_email and template:
+    if tool_qualification_expiration_enabled():
         for qualification in Qualification.objects.filter(user__is_active=True, user__is_staff=False).prefetch_related(
             "tool", "user"
         ):

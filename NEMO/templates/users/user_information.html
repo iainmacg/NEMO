@@ -119,9 +119,16 @@
                             <li>
                                 {{ tool_qualification.qualification.tool }}
                                 {% if tool_qualification.expiration_date %}
-                                    <span class="text-muted">
-                                        - expires on {{ tool_qualification.expiration_date|date:"SHORT_DATE_FORMAT" }}
-                                        (last used: {{ tool_qualification.last_tool_use|date:"SHORT_DATE_FORMAT"|default:"never" }})
+                                    <span class="{% if tool_qualification.expired %}text-danger{% else %}text-muted{% endif %}">
+                                        - {% if tool_qualification.expired %}expired{% else %}expires{% endif %} on {{ tool_qualification.expiration_date|date:"SHORT_DATE_FORMAT" }}
+                                        {% if not tool_qualification.last_tool_use %}
+                                            (last used: never)
+                                        {% elif tool_qualification.last_tool_use > tool_qualification.qualification.qualified_on %}
+                                            (last used: {{ tool_qualification.last_tool_use|date:"SHORT_DATE_FORMAT" }})
+                                        {% else %}
+                                            {# Last use is before the qualification date, so expiration is based on the qualification date #}
+                                            (qualified on: {{ tool_qualification.qualification.qualified_on|date:"SHORT_DATE_FORMAT" }})
+                                        {% endif %}
                                     </span>
                                 {% endif %}
                             </li>

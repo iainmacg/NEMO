@@ -2,8 +2,12 @@ from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 from django.core.files.base import ContentFile
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
 from django.utils import timezone
+from django.utils.formats import date_format
 
 from NEMO.models import Account, EmailLog, Project, Qualification, Tool, UsageEvent, User
 from NEMO.tests.test_utilities import NEMOTestCaseMixin
@@ -376,3 +380,80 @@ class ToolQualificationTestCase(NEMOTestCaseMixin, TestCase):
         )
         last_use = timezone.localtime(usage_start).date()
         self.assertEqual(qualification.get_last_use_and_expiration_date(), (last_use, last_use + timedelta(days=30)))
+        # Requalified after last use: based on qualification date
+        qualification.qualified_on = date.today()
+        qualification.save()
+        self.assertEqual(
+            qualification.get_last_use_and_expiration_date(), (date.today(), date.today() + timedelta(days=30))
+        )
+
+    def test_qualification_expiration_on_user_profile(self, mock_open, mock_exist):
+        mock_exist.return_value = True
+        mock_open.side_effect = lambda *args, **kwargs: ContentFile(b"Email template", name="template")
+        qualification_date = date.today() - timedelta(days=10)
+        Qualification.objects.create(tool=self.tool, user=self.user, qualified_on=qualification_date)
+        self.tool.qualification_expiration_days = 30
+        self.tool.qualification_expiration_never_used_days = 20
+        self.tool.save()
+        self.login_as_staff()
+        url = reverse("view_user", args=[self.user.id])
+        # Qualifications don't expire without the user office email, so nothing is shown
+        self.assertNotContains(self.client.get(url), "expires on")
+        EmailsCustomization.set("user_office_email_address", "user_office@example.com")
+        # Never used: based on qualification date
+        response = self.client.get(url)
+        self.assertContains(response, f"expires on {short_date(qualification_date + timedelta(days=20))}")
+        self.assertContains(response, "(last used: never)")
+        # Used before qualification date: based on qualification date
+        usage_start = timezone.now() - timedelta(days=15)
+        UsageEvent.objects.create(
+            user=self.user, operator=self.user, tool=self.tool, project=self.project, start=usage_start, end=usage_start
+        )
+        response = self.client.get(url)
+        self.assertContains(response, f"expires on {short_date(qualification_date + timedelta(days=30))}")
+        self.assertContains(response, f"(qualified on: {short_date(qualification_date)})")
+        # Used after qualification date: based on last use
+        usage_start = timezone.now() - timedelta(days=2)
+        UsageEvent.objects.create(
+            user=self.user, operator=self.user, tool=self.tool, project=self.project, start=usage_start, end=usage_start
+        )
+        last_use = timezone.localtime(usage_start).date()
+        response = self.client.get(url)
+        self.assertContains(response, f"expires on {short_date(last_use + timedelta(days=30))}")
+        self.assertContains(response, f"(last used: {short_date(last_use)})")
+        # Expiration date passed
+        self.tool.qualification_expiration_days = 1
+        self.tool.save()
+        self.assertContains(self.client.get(url), f"expired on {short_date(last_use + timedelta(days=1))}")
+        # Staff on tools are exempt
+        self.tool._staff.add(self.user)
+        response = self.client.get(url)
+        self.assertNotContains(response, "expires on")
+        self.assertNotContains(response, "expired on")
+
+    def test_user_profile_qualification_queries(self, mock_open, mock_exist):
+        mock_exist.return_value = True
+        mock_open.side_effect = lambda *args, **kwargs: ContentFile(b"Email template", name="template")
+        EmailsCustomization.set("user_office_email_address", "user_office@example.com")
+        Qualification.objects.create(tool=self.tool, user=self.user)
+        self.login_as_staff()
+        url = reverse("view_user", args=[self.user.id])
+        # Warm up caches
+        self.client.get(url)
+        with CaptureQueriesContext(connection) as one_qualification:
+            self.client.get(url)
+        # Tools without expiration, and tools with expiration the user is staff on, don't add queries
+        for i in range(4):
+            tool = Tool.objects.create(name=f"tool_{i}", primary_owner=self.owner, _category="Imaging")
+            if i % 2:
+                tool.qualification_expiration_days = 30
+                tool.save()
+                tool._staff.add(self.user)
+            Qualification.objects.create(tool=tool, user=self.user)
+        with CaptureQueriesContext(connection) as five_qualifications:
+            self.client.get(url)
+        self.assertEqual(len(one_qualification), len(five_qualifications))
+
+
+def short_date(value: date) -> str:
+    return date_format(value, "SHORT_DATE_FORMAT")

@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import date, timedelta
 from logging import getLogger
 from django.contrib import messages
 from django.contrib.admin import ModelAdmin
@@ -34,6 +34,7 @@ from NEMO.utilities import queryset_search_filter
 from NEMO.views.customization import ApplicationCustomization, StatusDashboardCustomization, UserCustomization
 from NEMO.views.pagination import SortedPaginator
 from NEMO.views.status_dashboard import show_staff_status
+from NEMO.views.timed_services import tool_qualification_expiration_enabled
 from NEMO.policy import policy_class as policy
 
 users_logger = getLogger(__name__)
@@ -436,7 +437,6 @@ def get_profile_dictionary(user_id) -> dict:
     user = (
         User.objects.filter(pk=user_id)
         .prefetch_related(
-            "qualifications",
             "groups",
             "physical_access_levels",
             "primary_tool_owner",
@@ -453,13 +453,28 @@ def get_profile_dictionary(user_id) -> dict:
         raise Http404("No user matches the given query")
 
     tool_qualifications = []
-    for qualification in user.qualification_set.select_related("tool").order_by("tool__name"):
-        last_tool_use, expiration_date = qualification.get_last_use_and_expiration_date()
-        # Staff and staff on tools are exempt from qualification expiration
-        if user.is_staff_on_tool(qualification.tool):
-            expiration_date = None
+    expiration_enabled = tool_qualification_expiration_enabled()
+    for qualification in (
+        user.qualification_set.select_related("tool__parent_tool")
+        .prefetch_related("tool___staff", "tool__parent_tool___staff")
+        .order_by("tool__name")
+    ):
+        tool = qualification.tool
+        last_tool_use, expiration_date = None, None
+        # Same rules as the tool qualification timed service. Staff and staff on tools are exempt
+        if (
+            expiration_enabled
+            and (tool.qualification_expiration_days or tool.qualification_expiration_never_used_days)
+            and not user.is_staff_on_tool(tool)
+        ):
+            last_tool_use, expiration_date = qualification.get_last_use_and_expiration_date()
         tool_qualifications.append(
-            {"qualification": qualification, "last_tool_use": last_tool_use, "expiration_date": expiration_date}
+            {
+                "qualification": qualification,
+                "last_tool_use": last_tool_use,
+                "expiration_date": expiration_date,
+                "expired": bool(expiration_date and expiration_date <= date.today()),
+            }
         )
 
     return {
