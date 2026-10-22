@@ -6,6 +6,7 @@ from django.utils import timezone
 
 from NEMO.models import Reservation, Tool, User
 from NEMO.tests.test_utilities import NEMOTestCaseMixin, create_user_and_project
+from NEMO.views.customization import CalendarCustomization
 
 
 class CalendarTestCase(NEMOTestCaseMixin, TestCase):
@@ -34,6 +35,8 @@ class CalendarTestCase(NEMOTestCaseMixin, TestCase):
         other_user, other_project = create_user_and_project()
         pi, pi_project = create_user_and_project()
         pi.managed_projects.add(team_project)
+        # other user is also a member of the team project, but not a PI
+        other_user.projects.add(team_project)
         start = timezone.now().replace(hour=10, minute=0, second=0, microsecond=0)
         for user, project in [(team_member, team_project), (other_user, other_project)]:
             Reservation.objects.create(
@@ -58,9 +61,15 @@ class CalendarTestCase(NEMOTestCaseMixin, TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, team_member.username)
         self.assertNotContains(response, other_user.username)
-        # Regular user doesn't see the option or any reservations
+        # Project member doesn't see the option or any reservations by default
         self.login_as(other_user)
         self.assertNotContains(self.client.get(reverse("calendar")), 'id="extra-links-team-schedule"')
         response = self.client.get(reverse("event_feed"), feed_data)
         self.assertNotContains(response, team_member.username)
         self.assertNotContains(response, other_user.username)
+        # Unless the team schedule is enabled for project members
+        CalendarCustomization.set("calendar_team_schedule_project_members", "enabled")
+        self.assertContains(self.client.get(reverse("calendar")), 'id="extra-links-team-schedule"')
+        response = self.client.get(reverse("event_feed"), feed_data)
+        self.assertContains(response, team_member.username)
+        self.assertContains(response, other_user.username)

@@ -441,6 +441,7 @@ class CalendarCustomization(CustomizationBase):
         "calendar_all_tools": "",
         "calendar_all_areas": "",
         "calendar_all_areastools": "",
+        "calendar_team_schedule_project_members": "",
         "calendar_outage_recurrence_limit": "90",
         "calendar_qualified_tools": "",
         "calendar_tool_category_filter": "",

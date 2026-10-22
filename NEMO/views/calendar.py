@@ -149,7 +149,9 @@ def calendar(request, item_type=None, item_id=None):
         "reservation_confirmation_time_format": reservation_confirmation_time_format,
         "self_login": False,
         "self_logout": False,
-        "team_schedule": user.managed_projects.exists() or user.managed_accounts.exists(),
+        "team_schedule": user.managed_projects.exists()
+        or user.managed_accounts.exists()
+        or (CalendarCustomization.get_bool("calendar_team_schedule_project_members") and user.projects.exists()),
     }
     login_logout = ApplicationCustomization.get_bool("calendar_login_logout", raise_exception=False)
     self_login = ApplicationCustomization.get_bool("self_log_in", raise_exception=False)
@@ -272,10 +274,13 @@ def reservation_event_feed(request, start, end):
     if personal_schedule:
         events = events.filter(user=request.user)
 
-    # Filter events that only have to do with the projects the current user manages.
+    # Filter events that only have to do with the projects the current user manages (or is a member of).
     team_schedule = request.GET.get("team_schedule")
     if team_schedule:
-        events = events.filter(project__in=get_managed_projects(request.user))
+        team_projects = get_managed_projects(request.user)
+        if CalendarCustomization.get_bool("calendar_team_schedule_project_members"):
+            team_projects = team_projects.union(request.user.projects.all())
+        events = events.filter(project__in=team_projects)
 
     dictionary = {
         "events": events,

@@ -223,6 +223,14 @@
                     </label>
                     <label style="padding-right: 20px;">
                         <input type="checkbox"
+                               id="calendar_team_schedule_project_members"
+                               name="calendar_team_schedule_project_members"
+                               {% if calendar_team_schedule_project_members %}checked{% endif %}
+                               value="enabled">
+                        Show team schedule (reservations) to all project members, not only PIs and account managers
+                    </label>
+                    <label style="padding-right: 20px;">
+                        <input type="checkbox"
                                id="calendar_qualified_tools"
                                name="calendar_qualified_tools"
                                {% if calendar_qualified_tools %}checked{% endif %}
