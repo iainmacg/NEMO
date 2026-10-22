@@ -133,6 +133,15 @@
                        onclick="set_selected_item(this, true)"
                        style="width: 100%">Personal schedule</a>
                 </li>
+                {% if team_schedule %}
+                    <li>
+                        <a href="javascript:void(0)"
+                           id="extra-links-team-schedule"
+                           class="team_schedule"
+                           data-item-id="team_schedule"
+                           onclick="on_extra_link_click(this)">Team schedule</a>
+                    </li>
+                {% endif %}
                 {% if calendar_all_tools %}
                     <li>
                         <a href="javascript:void(0)"
@@ -213,6 +222,10 @@ function update_event_sources()
 		if(item === 'personal_schedule' && !has_checked_items)
 		{
             add_item_to_event_feed_list(item_event_source_list, url, event_type, { personal_schedule: true });
+		}
+		else if(item === 'team_schedule')
+		{
+            add_item_to_event_feed_list(item_event_source_list, url, event_type, { team_schedule: true });
 		}
 		else if(item === 'all_tools')
 		{
@@ -396,8 +409,9 @@ function create(start, end, jsEvent, view)
 	let all_tools = item.hasClass('all_tools');
 	let all_areas = item.hasClass('all_areas');
 	let all_areastools = item.hasClass('all_areastools');
+	let team_schedule = item.hasClass('team_schedule');
 	let user_list = item.parent().hasClass('user-tool-list');
-	if(!item_selected || !reservation_view || personal_schedule || all_tools || all_areas || all_areastools || user_list)
+	if(!item_selected || !reservation_view || personal_schedule || all_tools || all_areas || all_areastools || team_schedule || user_list)
 	{
 		$("#calendar").fullCalendar("unselect");
 		return;
@@ -835,7 +849,7 @@ function change_calendar_event_type(calling_element)
     let item_tree_tools = $("#item-tree-tool");
     let item_tree_areas = $("#item-tree-area");
 	let event_type = get_event_type();
-    let extra_links_personal_schedule = $("#extra-links-personal-schedule, #checkbox-personal-schedule-personal-schedule");
+    let extra_links_personal_schedule = $("#extra-links-personal-schedule, #checkbox-personal-schedule-personal-schedule, #extra-links-team-schedule");
     let extra_links_all_tools = $("#extra-links-all-tools");
     let extra_links_all_areas = $("#extra-links-all-areas");
     let extra_links_all_areastools = $("#extra-links-all-areastools");

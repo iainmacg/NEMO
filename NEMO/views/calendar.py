@@ -57,6 +57,7 @@ from NEMO.views.customization import (
     ToolCustomization,
     get_media_file_contents,
 )
+from NEMO.views.usage import get_managed_projects
 
 calendar_logger = getLogger(__name__)
 
@@ -148,6 +149,7 @@ def calendar(request, item_type=None, item_id=None):
         "reservation_confirmation_time_format": reservation_confirmation_time_format,
         "self_login": False,
         "self_logout": False,
+        "team_schedule": user.managed_projects.exists() or user.managed_accounts.exists(),
     }
     login_logout = ApplicationCustomization.get_bool("calendar_login_logout", raise_exception=False)
     self_login = ApplicationCustomization.get_bool("self_log_in", raise_exception=False)
@@ -270,6 +272,11 @@ def reservation_event_feed(request, start, end):
     if personal_schedule:
         events = events.filter(user=request.user)
 
+    # Filter events that only have to do with the projects the current user manages.
+    team_schedule = request.GET.get("team_schedule")
+    if team_schedule:
+        events = events.filter(project__in=get_managed_projects(request.user))
+
     dictionary = {
         "events": events,
         "outages": outages,
@@ -277,7 +284,7 @@ def reservation_event_feed(request, start, end):
         "all_tools": all_tools,
         "all_areas": all_areas,
         "all_areastools": all_areastools,
-        "display_name": display_name,
+        "display_name": display_name or team_schedule,
         "display_configuration": CalendarCustomization.get_bool("calendar_configuration_in_reservations"),
     }
     return render(request, "calendar/reservation_event_feed.html", dictionary)
@@ -292,6 +299,7 @@ def usage_event_feed(request, start, end):
     item_type = ReservationItemType(request.GET.get("item_type")) if request.GET.get("item_type") else None
 
     personal_schedule = request.GET.get("personal_schedule")
+    team_schedule = request.GET.get("team_schedule")
     all_areas = request.GET.get("all_areas")
     all_tools = request.GET.get("all_tools")
     all_areastools = request.GET.get("all_areastools")
@@ -302,6 +310,12 @@ def usage_event_feed(request, start, end):
         usage_events = UsageEvent.objects.filter(user=request.user)
         area_access_events = AreaAccessRecord.objects.filter(customer=request.user)
         missed_reservations = Reservation.objects.filter(missed=True, user=request.user)
+    elif team_schedule:
+        # Filter events that only have to do with the projects the current user manages.
+        managed_projects = get_managed_projects(request.user)
+        usage_events = UsageEvent.objects.filter(project__in=managed_projects)
+        area_access_events = AreaAccessRecord.objects.filter(project__in=managed_projects)
+        missed_reservations = Reservation.objects.filter(missed=True, project__in=managed_projects)
     elif all_areas:
         area_access_events = AreaAccessRecord.objects.filter()
         missed_reservations = Reservation.objects.filter(missed=True, tool=None)
